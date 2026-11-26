@@ -1,6 +1,7 @@
 package dev.coreamlan.corelink
 
 import android.util.Base64
+import android.content.Context
 import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.OutputStreamWriter
@@ -14,23 +15,27 @@ import javax.crypto.spec.GCMParameterSpec
 
 /** Wire client for the desktop's local-only protocol. It never opens a listener. */
 class CoreLinkClient(private val host: String, private val port: Int = 49876) {
-    private val deviceId = "android-" + android.os.Build.SERIAL.takeLast(8)
+    private val deviceId = requireNotNull(identity) { "CoreLink client was not initialized" }
     private var key: ByteArray? = null
     private fun hash(vararg values: ByteArray) = MessageDigest.getInstance("SHA-256").digest(values.fold(ByteArray(0)) { a, b -> a + b })
     private fun b64(value: ByteArray) = Base64.encodeToString(value, Base64.NO_WRAP)
     private fun socket(): Pair<Socket, BufferedReader> {
         val address = InetAddress.getByName(host)
         require(address is Inet4Address && (address.isSiteLocalAddress || address.isLinkLocalAddress || address.isLoopbackAddress)) { "CoreLink accepts local Wi-Fi addresses only" }
-        val s = Socket(address, port).apply { soTimeout = 7000 }
+        val s = Socket().apply { connect(java.net.InetSocketAddress(address, port), 10_000); soTimeout = 10_000 }
         return s to s.getInputStream().bufferedReader()
     }
-    private fun send(s: Socket, value: JSONObject) { val writer=OutputStreamWriter(s.getOutputStream()); writer.write(value.toString()+"\n"); writer.flush() }
+    private fun send(s: Socket, value: JSONObject) {
+        val writer = OutputStreamWriter(s.getOutputStream())
+        writer.write(value.toString() + "\n")
+        writer.flush()
+    }
     fun pair(code: String, name: String): Result<Unit> = runCatching {
         require(code.matches(Regex("\\d{6}"))) { "Enter the six-digit pairing code" }
         val (helloSocket, helloReader) = socket(); send(helloSocket, JSONObject().put("type","hello")); val hello=JSONObject(helloReader.readLine()); helloSocket.close()
         val nonce = hello.getString("nonce"); val clientNonce=ByteArray(16).also { SecureRandom().nextBytes(it) }; val clientNonceText=b64(clientNonce)
         val proof=b64(hash(deviceId.toByteArray(), code.toByteArray(), nonce.toByteArray(), clientNonceText.toByteArray()))
-        val (s,r)=socket(); send(s,JSONObject().put("type","pair_request").put("id",deviceId).put("name",name).put("proof",proof).put("client_nonce",clientNonceText))
+        val (s,r)=socket(); s.soTimeout = 100_000; send(s,JSONObject().put("type","pair_request").put("id",deviceId).put("name",name).put("proof",proof).put("client_nonce",clientNonceText))
         val waiting=JSONObject(r.readLine()); require(waiting.getString("type")=="approval_required") { "Desktop rejected the pairing request" }
         val reply=JSONObject(r.readLine()); require(reply.getString("type")=="paired") { "Pairing was not approved" }
         val candidate=hash(code.toByteArray(),nonce.toByteArray(),clientNonceText.toByteArray(),deviceId.toByteArray())
@@ -45,4 +50,13 @@ class CoreLinkClient(private val host: String, private val port: Int = 49876) {
         require(JSONObject(r.readLine()).optBoolean("ok")) { "Desktop rejected the input" }; s.close()
     }
     fun disconnect() { key=null }
+    companion object {
+        @Volatile private var identity: String? = null
+        fun initialize(context: Context) {
+            val prefs = context.getSharedPreferences("corelink", Context.MODE_PRIVATE)
+            identity = prefs.getString("device_id", null) ?: ("android-" + ByteArray(16).also { SecureRandom().nextBytes(it) }.joinToString("") { "%02x".format(it) }).also {
+                prefs.edit().putString("device_id", it).apply()
+            }
+        }
+    }
 }

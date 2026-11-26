@@ -128,6 +128,11 @@ enum Message {
 
 impl CompanionState {
     pub fn start(&self) -> Result<(), String> {
+        // Bind before publishing a running state: a firewall/port conflict must not
+        // leave the desktop UI reporting a service that does not exist.
+        let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, COMPANION_PORT))
+            .map_err(|e| format!("Could not open CoreLink companion port: {e}"))?;
+        listener.set_nonblocking(true).map_err(|e| e.to_string())?;
         {
             let mut inner = self.0.lock().map_err(|_| "Companion state lock failed")?;
             if inner.running {
@@ -135,9 +140,6 @@ impl CompanionState {
             }
             inner.running = true;
         }
-        let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, COMPANION_PORT))
-            .map_err(|e| format!("Could not open CoreLink companion port: {e}"))?;
-        listener.set_nonblocking(true).map_err(|e| e.to_string())?;
         let state = self.clone();
         thread::spawn(move || loop {
             match listener.accept() {

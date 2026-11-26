@@ -12,5 +12,7 @@ dependencies {
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
+    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
+    implementation("org.bouncycastle:bcprov-jdk18on:1.79")
     debugImplementation("androidx.compose.ui:ui-tooling")
 }
