@@ -2,6 +2,8 @@ use serde::Serialize;
 use std::{process::{Child, Command, Stdio}, sync::Mutex, net::Ipv4Addr};
 use tauri::State;
 use tauri_plugin_autostart::MacosLauncher;
+use std::{io::Read, time::Duration};
+use wait_timeout::ChildExt;
 
 #[derive(Default)]
 struct MirrorState(Mutex<Option<Child>>);
@@ -49,10 +51,23 @@ fn tool_location(name: &str) -> Tool {
 fn adb_output(args: &[&str]) -> Result<String, String> {
     let tool = tool_location("adb");
     let path = tool.path.ok_or("ADB not found in PATH. Install Android SDK Platform-Tools and restart CoreLink.")?;
-    let output = hidden_command(&path).args(args).output().map_err(|e| format!("Failed to run ADB: {e}"))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if output.status.success() { Ok(stdout) } else { Err(format!("ADB failed: {}", if stderr.is_empty() { stdout } else { stderr })) }
+    let mut child = hidden_command(&path).args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| format!("Failed to run ADB: {e}"))?;
+    let mut stdout_pipe = child.stdout.take().ok_or("Could not capture ADB output")?;
+    let mut stderr_pipe = child.stderr.take().ok_or("Could not capture ADB errors")?;
+    let stdout_reader = std::thread::spawn(move || { let mut bytes = Vec::new(); let _ = stdout_pipe.read_to_end(&mut bytes); bytes });
+    let stderr_reader = std::thread::spawn(move || { let mut bytes = Vec::new(); let _ = stderr_pipe.read_to_end(&mut bytes); bytes });
+    let status = match child.wait_timeout(Duration::from_secs(30)).map_err(|e| e.to_string())? {
+        Some(status) => status,
+        None => { let _ = child.kill(); let _ = child.wait(); let _ = stdout_reader.join(); let _ = stderr_reader.join(); return Err("ADB timed out. Check the phone and try again.".into()); }
+    };
+    let stdout_bytes = stdout_reader.join().map_err(|_| "Could not read ADB output")?;
+    let stderr_bytes = stderr_reader.join().map_err(|_| "Could not read ADB errors")?;
+    let stdout = String::from_utf8_lossy(&stdout_bytes).trim().to_string();
+    let stderr = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
+    let combined = format!("{stdout}\n{stderr}");
+    if status.success() && !combined.to_ascii_lowercase().contains("failed") && !combined.to_ascii_lowercase().contains("unable to connect") {
+        Ok(if stdout.is_empty() { stderr } else { stdout })
+    } else { Err(format!("ADB failed: {}", if stderr.is_empty() { stdout } else { stderr })) }
 }
 
 fn parse_devices(output: &str) -> Vec<Device> {
@@ -87,7 +102,7 @@ fn local_endpoint(value: &str) -> Result<(), String> {
 fn get_snapshot(state: State<'_, MirrorState>) -> Result<Snapshot, String> {
     let adb = tool_location("adb");
     let scrcpy = tool_location("scrcpy");
-    let devices = if adb.found { checked_devices().unwrap_or_default() } else { Vec::new() };
+    let devices = if adb.found { checked_devices()? } else { Vec::new() };
     let mut child = state.0.lock().map_err(|_| "Mirroring state lock failed")?;
     let mirroring = if let Some(p) = child.as_mut() {
         match p.try_wait() {
