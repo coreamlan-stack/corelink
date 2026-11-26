@@ -21,7 +21,10 @@ class CompanionViewModel : ViewModel() {
         if (_ui.value.busy) return
         _ui.value = CompanionUiState(busy = true, message = "Requesting desktop approval…")
         viewModelScope.launch {
-            val result = withContext(Dispatchers.IO) { CoreLinkClient(host.trim()).pair(code, android.os.Build.MODEL) }
+            val result = withContext(Dispatchers.IO) {
+                val candidate = CoreLinkClient(host.trim())
+                candidate.pair(code, android.os.Build.MODEL).map { candidate }
+            }
             result.onSuccess { candidate -> client = candidate; _ui.value = CompanionUiState(connected = true, message = "Connected") }
                 .onFailure { problem -> _ui.value = CompanionUiState(message = problem.message ?: "Pairing failed", error = true) }
         }

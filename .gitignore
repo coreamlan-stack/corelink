@@ -5,3 +5,10 @@ src-tauri/gen/
 .env
 *.log
 .DS_Store
+**/.gradle/
+**/build/
+local.properties
+*.tmp
+*.temp
+*.swp
+!apps/android/gradle/wrapper/gradle-wrapper.jar
