@@ -43,8 +43,10 @@ export default function App() {
     (async () => {
       try {
         const current = await isEnabled();
-        if (!current) await enable(); // User requested Windows autostart, initialized on first launch.
-        if (!cancelled) setAutostart(true);
+        const initialized = localStorage.getItem('corelink-autostart-initialized');
+        if (!initialized && !current) await enable();
+        if (!initialized) localStorage.setItem('corelink-autostart-initialized', '1');
+        if (!cancelled) setAutostart(!initialized ? true : current);
       } catch (e) {
         if (!cancelled) { setAutostart(false); setInfo(`Windows autostart could not be enabled: ${errorMessage(e)}`); }
       }

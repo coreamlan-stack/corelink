@@ -6,9 +6,11 @@ export function validEndpoint(value) {
   if (!Number.isInteger(port) || port < 1 || port > 65535) return false;
   const host = value.slice(0, pos);
   if (host.includes('.') && /^(?:\d+\.){3}\d+$/.test(host)) {
-    if (host.split('.').some(n => Number(n) > 255)) return false;
+    const octets = host.split('.').map(Number);
+    if (octets.some(n => n > 255)) return false;
+    return octets[0] === 10 || octets[0] === 127 || (octets[0] === 192 && octets[1] === 168) || (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) || (octets[0] === 169 && octets[1] === 254);
   }
-  return true;
+  return false;
 }
 export function normalizeDeviceState(state) {
   return state === 'device' ? 'Ready' : state === 'unauthorized' ? 'Authorize on phone' : state === 'offline' ? 'Offline' : state;

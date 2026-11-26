@@ -12,7 +12,7 @@ A real, local-first Windows desktop workspace for mirroring and controlling Andr
 - USB fallback: plug in your phone and authorize ADB, then select the device.
 - Only local/private network endpoints are accepted by the app. No cloud service, telemetry, account or public port forwarding.
 
-The mirrored Android screen opens in **scrcpy's own native window**. It is not embedded in the Tauri window in Phase 1. Closing CoreLink while the mirror is running may leave the child process active; use **Stop mirroring** first. Future work will add a managed shutdown handler.
+The mirrored Android screen opens in **scrcpy's own native window**. It is not embedded in the Tauri window in Phase 1. CoreLink attempts to stop its managed scrcpy process when the application shuts down normally.
 
 ## Prerequisites (Windows 10/11)
 

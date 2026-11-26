@@ -6,6 +6,17 @@ use tauri_plugin_autostart::MacosLauncher;
 #[derive(Default)]
 struct MirrorState(Mutex<Option<Child>>);
 
+impl Drop for MirrorState {
+    fn drop(&mut self) {
+        if let Ok(slot) = self.0.get_mut() {
+            if let Some(child) = slot.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct Tool { found: bool, path: Option<String> }
 #[derive(Serialize)]
