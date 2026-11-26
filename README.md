@@ -90,9 +90,15 @@ git push -u origin main
 
 **Do not** add a GitHub-generated README or .gitignore when creating the empty repository. This project already includes both.
 
-## Next phases (not implemented)
+## Phase 2 companion input
 
-Phase 2: Android companion + PC streaming using a Sunshine/Moonlight-based implementation. Phase 3: touchpad mode and unified transport. No fake screens or placeholders for these unfinished modes are included.
+`apps/android/` contains the native Kotlin + Jetpack Compose companion. Its touchpad connects only to an owner-started CoreLink companion service on a private LAN. Pairing is a short-lived six-digit proof plus explicit Windows approval; input packets use AES-256-GCM, expire after 15 minutes, and are validated before Windows input is sent. Stopping the service revokes all active sessions immediately.
+
+The initial transport deliberately uses manual private-IP entry instead of pretending a PC was discovered. It does not capture a screen and it does not accept public-network connections. See [Companion setup](docs/COMPANION_SETUP.md) and the separate [Windows video streaming plan](docs/WINDOWS_VIDEO_STREAMING_PLAN.md).
+
+### Android build
+
+Install Android Studio with Android SDK Platform 35, then open `apps/android/` and run the `app` debug build. The APK is emitted at `apps/android/app/build/outputs/apk/debug/app-debug.apk`. Android builds require an installed SDK/Gradle; they cannot be produced from a Windows machine that only has Java.
 
 ### Quick Windows prerequisite audit
 

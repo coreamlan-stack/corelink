@@ -8,6 +8,8 @@ use std::{
 use tauri::State;
 use tauri_plugin_autostart::MacosLauncher;
 use wait_timeout::ChildExt;
+mod companion;
+use companion::{CompanionSnapshot, CompanionState};
 
 #[derive(Default)]
 struct MirrorState(Mutex<Option<Child>>);
@@ -294,9 +296,55 @@ fn stop_mirroring(state: State<'_, MirrorState>) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+fn start_companion_service(state: State<'_, CompanionState>) -> Result<CompanionSnapshot, String> {
+    state.start()?;
+    Ok(state.snapshot())
+}
+
+#[tauri::command]
+fn stop_companion_service(state: State<'_, CompanionState>) -> CompanionSnapshot {
+    state.stop();
+    state.snapshot()
+}
+
+#[tauri::command]
+fn companion_snapshot(state: State<'_, CompanionState>) -> CompanionSnapshot {
+    state.snapshot()
+}
+
+#[tauri::command]
+fn approve_companion_pairing(
+    request_id: String,
+    code: String,
+    state: State<'_, CompanionState>,
+) -> Result<CompanionSnapshot, String> {
+    state.approve(&request_id, code)?;
+    Ok(state.snapshot())
+}
+
+#[tauri::command]
+fn reject_companion_pairing(
+    request_id: String,
+    state: State<'_, CompanionState>,
+) -> Result<CompanionSnapshot, String> {
+    state.reject(&request_id)?;
+    Ok(state.snapshot())
+}
+
+#[tauri::command]
+fn revoke_companion_device(
+    device_id: String,
+    state: State<'_, CompanionState>,
+) -> Result<CompanionSnapshot, String> {
+    state.revoke(&device_id)?;
+    Ok(state.snapshot())
+}
+
 pub fn run() {
     tauri::Builder::default()
         .manage(MirrorState::default())
+        .manage(CompanionState::default())
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
             None,
@@ -306,7 +354,13 @@ pub fn run() {
             pair_device,
             connect_device,
             start_mirroring,
-            stop_mirroring
+            stop_mirroring,
+            start_companion_service,
+            stop_companion_service,
+            companion_snapshot,
+            approve_companion_pairing,
+            reject_companion_pairing,
+            revoke_companion_device
         ])
         .run(tauri::generate_context!())
         .expect("Failed to start CoreLink");
