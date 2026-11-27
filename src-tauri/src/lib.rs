@@ -298,8 +298,11 @@ fn stop_mirroring(state: State<'_, MirrorState>) -> Result<(), String> {
 
 #[tauri::command]
 fn start_companion_service(state: State<'_, CompanionState>) -> Result<CompanionSnapshot, String> {
-    state.start()?;
-    Ok(state.snapshot())
+    start_companion(&state)
+}
+
+fn start_companion(_state: &CompanionState) -> Result<CompanionSnapshot, String> {
+    Err("Companion service is disabled until secure pairing is available".into())
 }
 
 #[tauri::command]
@@ -369,6 +372,12 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn insecure_companion_service_cannot_be_enabled() {
+        let state = CompanionState::default();
+        assert!(start_companion(&state).is_err());
+        assert!(!state.snapshot().running);
+    }
     #[test]
     fn parses_real_adb_format() {
         let devices = parse_devices("List of devices attached\nR58ABC device product:a model:SM_S918B transport_id:1\nabc unauthorized\n");
