@@ -95,6 +95,18 @@ class CoreLinkClient private constructor(private val context: Context, private v
         }
     }
 
+    @Synchronized fun openAudio(): Result<SSLSocket> = runCatching {
+        val session = ensureSession()
+        val nonce = encode(ByteArray(32).also { SecureRandom().nextBytes(it) })
+        val socket = openSocket()
+        try {
+            val request = JSONObject().put("type", "audio_open").put("session_id", session.id)
+                .put("nonce", nonce).put("mac", sign(session.key, transcript("audio-open", session.id, nonce)))
+            OutputStreamWriter(socket.outputStream, Charsets.UTF_8).apply { write(request.toString() + "\n"); flush() }
+            socket
+        } catch (error: Exception) { socket.close(); throw error }
+    }
+
     private fun ensureSession(): Session {
         val existing = sessionId?.let { id -> sessionKey?.let { key -> Session(id, key) } }
         if (existing != null) return existing

@@ -10,6 +10,7 @@ use tauri_plugin_autostart::MacosLauncher;
 use wait_timeout::ChildExt;
 mod companion;
 mod capture;
+mod audio;
 use companion::{CompanionSnapshot, CompanionState};
 
 #[derive(Default)]

@@ -10,14 +10,11 @@ use windows::{
     core::Interface,
     Foundation::TypedEventHandler,
     Graphics::{
-        Capture::{
-            Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCapturePicker,
-            GraphicsCaptureSession,
-        },
+        Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession},
         DirectX::{Direct3D11::IDirect3DDevice, DirectXPixelFormat},
     },
     Win32::{
-        Foundation::{HMODULE, HWND},
+        Foundation::{HMODULE, POINT},
         Graphics::{
             Direct3D::D3D_DRIVER_TYPE_HARDWARE,
             Direct3D11::{
@@ -26,15 +23,16 @@ use windows::{
                 D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
             },
             Dxgi::IDXGIDevice,
+            Gdi::{MonitorFromPoint, MONITOR_DEFAULTTOPRIMARY},
         },
         System::{
             SystemInformation::GetTickCount64,
             WinRT::{
                 Direct3D11::{CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess},
+                Graphics::Capture::IGraphicsCaptureItemInterop,
                 RoInitialize, RoUninitialize, RO_INIT_MULTITHREADED,
             },
         },
-        UI::Shell::IInitializeWithWindow,
     },
 };
 
@@ -150,7 +148,7 @@ impl Drop for CaptureState {
 }
 
 fn capture(
-    hwnd: isize,
+    _hwnd: isize,
     stop: Arc<AtomicBool>,
     state: Arc<Mutex<CaptureSnapshot>>,
 ) -> Result<(), String> {
@@ -169,13 +167,19 @@ fn capture(
         if !GraphicsCaptureSession::IsSupported()? {
             return Err(windows::core::Error::from_win32());
         }
-        let picker = GraphicsCapturePicker::new()?;
-        unsafe {
-            picker
-                .cast::<IInitializeWithWindow>()?
-                .Initialize(HWND(hwnd as *mut _))?;
-        }
-        let item = picker.PickSingleItemAsync()?.get()?;
+        let factory = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
+        // (0,0) can lie on another monitor in a nonstandard layout; explicitly
+        // select the primary via an intentionally off-screen point instead.
+        let monitor = unsafe {
+            MonitorFromPoint(
+                POINT {
+                    x: i32::MIN,
+                    y: i32::MIN,
+                },
+                MONITOR_DEFAULTTOPRIMARY,
+            )
+        };
+        let item: GraphicsCaptureItem = unsafe { factory.CreateForMonitor(monitor)? };
         if stop.load(Ordering::SeqCst) {
             return Ok(());
         }
@@ -206,6 +210,17 @@ fn capture(
             size,
         )?;
         let session = pool.CreateCaptureSession(&item)?;
+        // A free-threaded frame pool reports availability on its own worker
+        // thread. Consume only after FrameArrived instead of polling the pool,
+        // so no-frame and actual readback errors remain distinguishable.
+        let (frame_ready, frame_events) = std::sync::mpsc::sync_channel::<()>(1);
+        pool.FrameArrived(&TypedEventHandler::<
+            Direct3D11CaptureFramePool,
+            windows::core::IInspectable,
+        >::new(move |_, _| {
+            let _ = frame_ready.try_send(());
+            Ok(())
+        }))?;
         let closed = stop.clone();
         item.Closed(&TypedEventHandler::<
             GraphicsCaptureItem,
@@ -224,6 +239,8 @@ fn capture(
             s.error.clear();
         }
         let mut last_tick = unsafe { GetTickCount64() };
+        let started_at = std::time::Instant::now();
+        let mut received_frame = false;
         let mut last_video = std::time::Instant::now() - Duration::from_secs(1);
         let mut encoder = FrameEncoder::default();
         while !stop.load(Ordering::SeqCst) {
@@ -233,7 +250,12 @@ fn capture(
                 break;
             }
             last_tick = now;
-            if let Ok(frame) = pool.TryGetNextFrame() {
+            if frame_events
+                .recv_timeout(Duration::from_millis(100))
+                .is_ok()
+            {
+                let frame = pool.TryGetNextFrame()?;
+                received_frame = true;
                 let next = frame.ContentSize()?;
                 if last_video.elapsed() >= Duration::from_millis(100)
                     && next.Width == size.Width
@@ -265,7 +287,10 @@ fn capture(
                     pool.Recreate(&device, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size)?;
                 }
             }
-            std::thread::sleep(Duration::from_millis(16));
+            if !received_frame && started_at.elapsed() >= Duration::from_secs(10) {
+                state.lock().unwrap().error = "Windows did not provide a display frame. Check capture permissions and try again.".into();
+                break;
+            }
         }
         session.Close()?;
         pool.Close()?;

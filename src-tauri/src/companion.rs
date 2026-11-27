@@ -19,6 +19,9 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use std::sync::atomic::{AtomicBool, Ordering};
+static HELD_LEFT: AtomicBool = AtomicBool::new(false);
+static HELD_RIGHT: AtomicBool = AtomicBool::new(false);
 pub const COMPANION_PORT: u16 = 49876;
 const ENROLLMENT_TTL: Duration = Duration::from_secs(120);
 const SESSION_TTL: Duration = Duration::from_secs(15 * 60);
@@ -247,6 +250,7 @@ impl CompanionState {
     pub fn stop(&self) {
         crate::capture::stop_active_capture();
         if let Ok(mut i) = self.0.lock() {
+            release_held_buttons();
             i.running = false;
             i.enrollment = None;
             i.pending.clear();
@@ -269,10 +273,16 @@ impl CompanionState {
         Ok(())
     }
     fn running(&self) -> bool {
-        self.0.lock().map(|i| i.running).unwrap_or(false)
+        self.0.lock().map(|mut i| {
+            let now=Instant::now();
+            if i.sessions.values().any(|s| s.expires <= now) { release_held_buttons(); }
+            i.sessions.retain(|_, s| s.expires > now);
+            i.running
+        }).unwrap_or(false)
     }
     pub fn snapshot(&self) -> CompanionSnapshot {
         let mut i = self.0.lock().expect("state");
+        if i.sessions.values().any(|s| s.expires <= Instant::now()) { release_held_buttons(); }
         i.sessions.retain(|_, s| s.expires > Instant::now());
         let (q, svg, e) = match (&i.enrollment, i.endpoint) {
             (Some(x), Some(ip)) if !x.used && x.expires > Instant::now() => {
@@ -307,6 +317,7 @@ impl CompanionState {
         if p.created.elapsed() > ENROLLMENT_TTL {
             return Err("Pairing request expired".into());
         }
+        if i.sessions.values().any(|session| session.device_id == p.request.device_id) { release_held_buttons(); }
         i.sessions
             .retain(|_, session| session.device_id != p.request.device_id);
         i.trusted.insert(
@@ -329,6 +340,7 @@ impl CompanionState {
     }
     pub fn revoke(&self, id: &str) -> Result<(), String> {
         let mut i = self.0.lock().map_err(|_| "state lock")?;
+        if i.sessions.values().any(|s| s.device_id == id) { release_held_buttons(); }
         i.trusted.remove(id);
         i.sessions.retain(|_, s| s.device_id != id);
         crate::capture::stop_active_capture();
@@ -360,6 +372,11 @@ enum Request {
         mac: String,
     },
     VideoOpen {
+        session_id: String,
+        nonce: String,
+        mac: String,
+    },
+    AudioOpen {
         session_id: String,
         nonce: String,
         mac: String,
@@ -449,6 +466,7 @@ fn serve(socket: TcpStream, state: CompanionState) {
             nonce,
             mac,
         }) => video(&mut tls, state, session_id, nonce, mac),
+        Ok(Request::AudioOpen { session_id, nonce, mac }) => audio(&mut tls, state, session_id, nonce, mac),
         Err(error) => { eprintln!("CoreLink companion request error: {error}"); }
     }
 }
@@ -550,6 +568,7 @@ fn open<W: Write>(o: &mut W, s: CompanionState, did: String, cn: String, tag: St
                 let sn = b64(random::<32>());
                 let k = session_key(&d.secret, &sid, &cn, &sn);
                 let proof = sign(&k, &transcript(&["session-opened", &did, &sid, &sn]));
+                if i.sessions.values().any(|x| x.device_id == did) { release_held_buttons(); }
                 i.sessions.retain(|_, x| x.device_id != did);
                 i.used_open_nonces.insert(cn);
                 i.sessions.insert(
@@ -621,6 +640,7 @@ fn disconnect<W: Write>(o: &mut W, s: CompanionState, id: String, seq: u64, tag:
                 &tag,
             );
         if valid {
+            release_held_buttons();
             let _ = i.sessions.remove(&id);
         }
         valid
@@ -629,6 +649,20 @@ fn disconnect<W: Write>(o: &mut W, s: CompanionState, id: String, seq: u64, tag:
         crate::capture::stop_active_capture();
     }
     let _ = send(o, &serde_json::json!({"type":"disconnected","ok":ok}));
+}
+fn audio<W: Write>(out: &mut W, state: CompanionState, id: String, nonce: String, tag: String) {
+    if URL_SAFE_NO_PAD.decode(&nonce).ok().filter(|v| v.len() == 32).is_none() { return; }
+    let authorized = if let Ok(mut i) = state.0.lock() {
+        let valid = i.running && !i.used_open_nonces.contains(&nonce) && i.sessions.get(&id).is_some_and(|s| s.expires > Instant::now() && check(&s.key, &transcript(&["audio-open", &id, &nonce]), &tag));
+        if valid { i.used_open_nonces.insert(nonce); }
+        valid
+    } else { false };
+    if !authorized { let _ = send(out, &serde_json::json!({"type":"audio_rejected"})); return; }
+    let Some(first) = crate::capture::latest_frame() else { let _ = send(out, &serde_json::json!({"type":"audio_unavailable"})); return; };
+    if let Err(error) = crate::audio::stream(out, || {
+        let active = state.0.lock().ok().is_some_and(|i| i.running && i.sessions.get(&id).is_some_and(|s| s.expires > Instant::now()));
+        active && crate::capture::latest_frame().is_some_and(|frame| first.same_capture(&frame))
+    }) { eprintln!("CoreLink audio stream ended: {error}"); }
 }
 fn video<W: Write>(o: &mut W, s: CompanionState, id: String, nonce: String, tag: String) {
     if URL_SAFE_NO_PAD
@@ -666,13 +700,14 @@ fn video<W: Write>(o: &mut W, s: CompanionState, id: String, nonce: String, tag:
             return;
         }
     };
-    struct StopCaptureOnDrop(crate::capture::VideoFrame);
+    struct StopCaptureOnDrop(crate::capture::VideoFrame, CompanionState);
     impl Drop for StopCaptureOnDrop {
         fn drop(&mut self) {
+            if let Ok(_guard) = self.1.0.lock() { release_held_buttons(); }
             crate::capture::stop_for_frame(&self.0);
         }
     }
-    let _stop_on_drop = StopCaptureOnDrop(first.clone());
+    let _stop_on_drop = StopCaptureOnDrop(first.clone(), s.clone());
     if send(o,&serde_json::json!({"type":"video_started","width":first.width,"height":first.height,"format":"bgra-zlib"})).is_err(){return}
     let dimensions = (first.width, first.height);
     let mut last_number = None;
@@ -710,6 +745,16 @@ fn video<W: Write>(o: &mut W, s: CompanionState, id: String, nonce: String, tag:
         thread::sleep(Duration::from_millis(33));
     }
 }
+fn virtual_key(key: &str) -> Option<u8> {
+    match key {
+        "tab" | "\t" => Some(0x09), "enter" | "\r" | "\n" => Some(0x0d),
+        "backspace" | "\u{8}" => Some(0x08), "escape" | "esc" => Some(0x1b),
+        "left" => Some(0x25), "up" => Some(0x26), "right" => Some(0x27), "down" => Some(0x28),
+        "delete" => Some(0x2e),
+        _ if key.len() == 1 && key.as_bytes()[0].is_ascii_alphanumeric() => Some(key.as_bytes()[0].to_ascii_uppercase()),
+        _ => None,
+    }
+}
 fn dispatch(i: Input) -> Result<(), String> {
     match &i {
         Input::Move { dx, dy } if dx.unsigned_abs() > 5000 || dy.unsigned_abs() > 5000 => {
@@ -721,10 +766,18 @@ fn dispatch(i: Input) -> Result<(), String> {
         {
             Err("button not allowed".into())
         }
-        Input::Key { key, .. } if key.len() > 32 => Err("key not allowed".into()),
+        Input::Key { key, .. } if virtual_key(key).is_none() => Err("key not allowed".into()),
         Input::Text { text } if text.len() > 2048 => Err("text too long".into()),
         _ => send_input(i),
     }
+}
+fn release_held_buttons() {
+    #[cfg(windows)] unsafe {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{mouse_event, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_RIGHTUP};
+        if HELD_LEFT.swap(false, Ordering::SeqCst) { mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0); }
+        if HELD_RIGHT.swap(false, Ordering::SeqCst) { mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0); }
+    }
+    #[cfg(not(windows))] { HELD_LEFT.store(false, Ordering::SeqCst); HELD_RIGHT.store(false, Ordering::SeqCst); }
 }
 #[cfg(windows)]
 fn send_input(i: Input) -> Result<(), String> {
@@ -747,6 +800,7 @@ fn send_input(i: Input) -> Result<(), String> {
                     _ => return Err("button not allowed".into()),
                 };
                 mouse_event(f, 0, 0, 0, 0)
+                ;if button == "left" { HELD_LEFT.store(down, Ordering::SeqCst); } else { HELD_RIGHT.store(down, Ordering::SeqCst); }
             }
             Input::Click { button } => {
                 let (d, u) = if button == "left" {
@@ -755,7 +809,8 @@ fn send_input(i: Input) -> Result<(), String> {
                     (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP)
                 };
                 mouse_event(d, 0, 0, 0, 0);
-                mouse_event(u, 0, 0, 0, 0)
+                mouse_event(u, 0, 0, 0, 0);
+                if button == "left" { HELD_LEFT.store(false, Ordering::SeqCst); } else { HELD_RIGHT.store(false, Ordering::SeqCst); }
             }
             Input::Key {
                 key,
@@ -763,6 +818,7 @@ fn send_input(i: Input) -> Result<(), String> {
                 alt,
                 shift,
             } => {
+                let code = virtual_key(&key).ok_or("key not allowed")?;
                 if ctrl {
                     keybd_event(VK_CONTROL.0 as u8, 0, Default::default(), 0)
                 }
@@ -772,10 +828,8 @@ fn send_input(i: Input) -> Result<(), String> {
                 if shift {
                     keybd_event(VK_SHIFT.0 as u8, 0, Default::default(), 0)
                 }
-                for c in key.bytes() {
-                    keybd_event(c.to_ascii_uppercase(), 0, Default::default(), 0);
-                    keybd_event(c.to_ascii_uppercase(), 0, KEYEVENTF_KEYUP, 0)
-                }
+                keybd_event(code, 0, Default::default(), 0);
+                keybd_event(code, 0, KEYEVENTF_KEYUP, 0);
                 if shift {
                     keybd_event(VK_SHIFT.0 as u8, 0, KEYEVENTF_KEYUP, 0)
                 }
@@ -824,6 +878,22 @@ fn send_input(_: Input) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn supported_keys_map_to_single_virtual_keys() {
+        assert_eq!(virtual_key("tab"), Some(0x09));
+        assert_eq!(virtual_key("\t"), Some(0x09));
+        assert_eq!(virtual_key("enter"), Some(0x0d));
+        assert_eq!(virtual_key("backspace"), Some(0x08));
+        assert_eq!(virtual_key("escape"), Some(0x1b));
+        assert_eq!(virtual_key("left"), Some(0x25));
+        assert_eq!(virtual_key("up"), Some(0x26));
+        assert_eq!(virtual_key("right"), Some(0x27));
+        assert_eq!(virtual_key("down"), Some(0x28));
+        assert_eq!(virtual_key("delete"), Some(0x2e));
+        assert_eq!(virtual_key("a"), Some(b'A'));
+        assert_eq!(virtual_key("F13"), None);
+        assert_eq!(virtual_key("é"), None);
+    }
     #[test]
     fn tls_enrollment_returns_approval_and_registers_pending() {
         use rustls::{ClientConfig, ClientConnection, RootCertStore, pki_types::ServerName};

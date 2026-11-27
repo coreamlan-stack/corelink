@@ -11,6 +11,8 @@ import androidx.compose.ui.viewinterop.AndroidView
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import org.json.JSONObject
 import java.io.DataInputStream
 import java.nio.ByteBuffer
@@ -30,7 +32,8 @@ fun DesktopVideo(open: () -> Result<SSLSocket>, modifier: Modifier = Modifier) {
         val closed = AtomicBoolean(false)
         val socket = AtomicReference<SSLSocket?>(null)
         val job = scope.launch(Dispatchers.IO) {
-            try {
+            while (isActive && !closed.get()) {
+              try {
                 val connection = open().getOrThrow()
                 socket.set(connection)
                 if (closed.get()) return@launch
@@ -38,7 +41,7 @@ fun DesktopVideo(open: () -> Result<SSLSocket>, modifier: Modifier = Modifier) {
                 val input = DataInputStream(connection.inputStream)
                 val header = JSONObject(readHeader(input))
                 check(header.optString("type") == "video_started" && header.optString("format") == "bgra-zlib") {
-                    if (header.optString("type") == "video_unavailable") "On your PC, start screen capture and choose a window or display. Then hide and show the PC screen to retry."
+                    if (header.optString("type") == "video_unavailable") "Waiting for the PC to share its screen…"
                     else header.optString("message", "Windows capture is not available. Check that the companion and screen capture are running on your PC.")
                 }
                 val width = header.getInt("width")
@@ -57,9 +60,11 @@ fun DesktopVideo(open: () -> Result<SSLSocket>, modifier: Modifier = Modifier) {
                     withContext(Dispatchers.Main) { imageView?.setImageBitmap(bitmap) }
                 }
             } catch (e: Exception) {
-                if (!closed.get()) withContext(Dispatchers.Main) { status = e.message ?: "Video disconnected" }
+                if (!closed.get() && isActive) withContext(Dispatchers.Main) { status = e.message ?: "Reconnecting to the PC…" }
             } finally {
                 runCatching { socket.getAndSet(null)?.close() }
+            }
+              if (isActive && !closed.get()) delay(1500)
             }
         }
         onDispose { closed.set(true); runCatching { socket.getAndSet(null)?.close() }; job.cancel() }

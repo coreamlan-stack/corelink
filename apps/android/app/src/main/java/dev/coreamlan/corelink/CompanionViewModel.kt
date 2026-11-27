@@ -50,6 +50,7 @@ class CompanionViewModel : ViewModel() {
         if (inputQueue.trySend(value).isFailure) _ui.value = _ui.value.copy(message = "Control queue is full; try again.", error = true)
     }
     fun openVideo(): Result<SSLSocket> = client?.openVideo() ?: Result.failure(IllegalStateException("Pair with this PC first"))
+    fun openAudio(): Result<SSLSocket> = client?.openAudio() ?: Result.failure(IllegalStateException("Pair with this PC first"))
     fun disconnect() {
         val old = client ?: return
         client = null
