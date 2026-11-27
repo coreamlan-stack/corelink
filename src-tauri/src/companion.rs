@@ -1,524 +1,61 @@
-//! Local-only companion protocol.  It deliberately has no HTTP endpoint and is
-//! started only after the owner enables it in the desktop UI.
-use aes_gcm::{
-    aead::{Aead, KeyInit},
-    Aes256Gcm, Nonce,
-};
-use base64::{engine::general_purpose::STANDARD as B64, Engine};
+//! Version 2 companion transport: TLS 1.3, QR-pinned one-time enrollment and
+//! authenticated control packets. There is deliberately no legacy fallback.
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use hmac::{Hmac, Mac};
+use qrcodegen::{QrCode, QrCodeEcc};
 use rand::RngCore;
+use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
+use rustls::{pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer}, ServerConfig, ServerConnection, StreamOwned};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{
-    collections::{HashMap, HashSet},
-    io::{BufRead, BufReader, Write},
-    net::{IpAddr, Ipv4Addr, TcpListener, TcpStream},
-    sync::{Arc, Mutex},
-    thread,
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, io::{BufRead, BufReader, Write}, net::{IpAddr, Ipv4Addr, TcpListener, TcpStream}, sync::{Arc, Mutex}, thread, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 
 pub const COMPANION_PORT: u16 = 49876;
-const PAIRING_TTL: Duration = Duration::from_secs(90);
+const ENROLLMENT_TTL: Duration = Duration::from_secs(120);
 const SESSION_TTL: Duration = Duration::from_secs(15 * 60);
-
-#[derive(Clone, Serialize)]
-pub struct PairRequest {
-    pub id: String,
-    pub name: String,
-    pub request_id: String,
-}
-#[derive(Clone, Serialize)]
-pub struct CompanionSnapshot {
-    pub running: bool,
-    pub port: u16,
-    pub pending: Vec<PairRequest>,
-    pub trusted_devices: Vec<String>,
-}
-struct Pending {
-    request: PairRequest,
-    proof: String,
-    client_nonce: String,
-    created: Instant,
-    approved_code: Option<String>,
-}
-struct Session {
-    key: [u8; 32],
-    expires: Instant,
-    seen_nonces: HashSet<String>,
-}
-struct Inner {
-    running: bool,
-    pairing_nonce: [u8; 16],
-    pending: HashMap<String, Pending>,
-    sessions: HashMap<String, Session>,
-    trusted: HashMap<String, String>,
-}
-#[derive(Clone)]
-pub struct CompanionState(Arc<Mutex<Inner>>);
-
-impl Default for CompanionState {
-    fn default() -> Self {
-        let mut n = [0; 16];
-        rand::thread_rng().fill_bytes(&mut n);
-        Self(Arc::new(Mutex::new(Inner {
-            running: false,
-            pairing_nonce: n,
-            pending: HashMap::new(),
-            sessions: HashMap::new(),
-            trusted: HashMap::new(),
-        })))
-    }
-}
-
-fn local(addr: IpAddr) -> bool {
-    match addr {
-        IpAddr::V4(v) => v.is_private() || v.is_loopback() || v.is_link_local(),
-        IpAddr::V6(v) => {
-            v.is_loopback()
-                || (v.segments()[0] & 0xfe00) == 0xfc00
-                || (v.segments()[0] & 0xffc0) == 0xfe80
-        }
-    }
-}
-fn digest(parts: &[&[u8]]) -> [u8; 32] {
-    let mut h = Sha256::new();
-    for p in parts {
-        h.update(p);
-    }
-    h.finalize().into()
-}
-fn expected_proof(id: &str, code: &str, nonce: &str, client_nonce: &str) -> String {
-    B64.encode(digest(&[
-        id.as_bytes(),
-        code.as_bytes(),
-        nonce.as_bytes(),
-        client_nonce.as_bytes(),
-    ]))
-}
-fn text_id() -> String {
-    let mut b = [0; 16];
-    rand::thread_rng().fill_bytes(&mut b);
-    B64.encode(b).replace(['+', '/', '='], "")
-}
-fn line(stream: &mut TcpStream, value: &impl Serialize) -> std::io::Result<()> {
-    let mut out = serde_json::to_vec(value).unwrap_or_default();
-    out.push(b'\n');
-    stream.write_all(&out)
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum Message {
-    Hello,
-    PairRequest {
-        id: String,
-        name: String,
-        proof: String,
-        client_nonce: String,
-    },
-    Input {
-        id: String,
-        nonce: String,
-        ciphertext: String,
-    },
-    Disconnect {
-        id: String,
-    },
-}
+const MAX_LINE: usize = 16 * 1024;
+type HmacSha256 = Hmac<Sha256>;
+#[derive(Clone, Serialize)] pub struct PairRequest { pub request_id:String, pub name:String, pub device_id:String }
+#[derive(Clone, Serialize)] pub struct TrustedDevice { pub device_id:String, pub name:String }
+#[derive(Clone, Serialize)] pub struct CompanionSnapshot { pub running:bool, pub port:u16, pub pending:Vec<PairRequest>, pub trusted_devices:Vec<TrustedDevice>, pub active_sessions:usize, pub qr_payload:Option<String>, pub qr_svg:Option<String>, pub expires_at:Option<u64> }
+struct Enrollment { token:[u8;32], expires:Instant, expires_at:u64, used:bool }
+struct Pending { request:PairRequest, secret:[u8;32], created:Instant }
+struct Device { name:String, secret:[u8;32] }
+struct Session { last_sequence:u64, expires:Instant }
+struct Identity { cert:CertificateDer<'static>, key:PrivateKeyDer<'static>, pin:String }
+struct Inner { running:bool, enrollment:Option<Enrollment>, pending:HashMap<String,Pending>, trusted:HashMap<String,Device>, sessions:HashMap<String,Session>, endpoint:Option<Ipv4Addr>, identity:Identity }
+#[derive(Clone)] pub struct CompanionState(Arc<Mutex<Inner>>);
+fn random<const N:usize>() -> [u8;N] { let mut b=[0;N];rand::thread_rng().fill_bytes(&mut b);b }
+fn b64(b:impl AsRef<[u8]>)->String { URL_SAFE_NO_PAD.encode(b) }
+fn unix()->u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() }
+fn private(ip:Ipv4Addr)->bool { ip.is_private()||ip.is_link_local() }
+fn private_peer(ip:IpAddr)->bool { matches!(ip,IpAddr::V4(v) if private(v)) }
+fn lan_ip()->Result<Ipv4Addr,String>{ let socket=std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e|e.to_string())?;socket.connect("192.0.2.1:9").map_err(|e|e.to_string())?;match socket.local_addr().map_err(|e|e.to_string())?.ip(){IpAddr::V4(ip)if private(ip)=>Ok(ip),_=>Err("Connect to a private Wi-Fi or Ethernet network before starting CoreLink Companion.".into())} }
+fn identity()->Identity { let mut p=CertificateParams::new(vec!["CoreLink.local".into()]).expect("cert params");let mut d=DistinguishedName::new();d.push(DnType::CommonName,"CoreLink local companion");p.distinguished_name=d;let k=KeyPair::generate().expect("key");let c=p.self_signed(&k).expect("cert");let der=c.der().clone();Identity{pin:b64(Sha256::digest(der.as_ref())),cert:der,key:PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(k.serialize_der()))} }
+impl Default for CompanionState { fn default()->Self{Self(Arc::new(Mutex::new(Inner{running:false,enrollment:None,pending:HashMap::new(),trusted:HashMap::new(),sessions:HashMap::new(),endpoint:None,identity:identity()})))} }
+fn server_config(i:&Identity)->Result<Arc<ServerConfig>,String>{ServerConfig::builder().with_no_client_auth().with_single_cert(vec![i.cert.clone()],i.key.clone_key()).map(Arc::new).map_err(|e|e.to_string())}
+fn send<S:Serialize,W:Write>(w:&mut W,value:&S)->std::io::Result<()> {let mut b=serde_json::to_vec(value)?;b.push(b'\n');w.write_all(&b)?;w.flush()}
+fn read<T:for<'de>Deserialize<'de>,R:BufRead>(r:&mut R)->Result<T,String>{let mut b=Vec::new();r.read_until(b'\n',&mut b).map_err(|_|"connection read failed")?;if b.is_empty()||b.len()>MAX_LINE{return Err("invalid message size".into())};serde_json::from_slice(&b).map_err(|_|"invalid message".into())}
+fn qr_svg(value:&str)->String{let q=QrCode::encode_text(value,QrCodeEcc::Medium).expect("QR");let border=3;let size=q.size()+border*2;let mut path=String::new();for y in 0..q.size(){for x in 0..q.size(){if q.get_module(x,y){path.push_str(&format!("M{} {}h1v1h-1z",x+border,y+border))}}};format!(r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {size} {size}" shape-rendering="crispEdges"><rect width="100%" height="100%" fill="white"/><path fill="black" d="{path}"/></svg>"#)}
+fn transcript(id:&str,seq:u64,kind:&str,body:&str)->Vec<u8>{format!("corelink-v2\n{id}\n{seq}\n{kind}\n{body}").into_bytes()}
+fn valid_mac(key:&[u8;32],data:&[u8],tag:&str)->bool{let Ok(tag)=URL_SAFE_NO_PAD.decode(tag)else{return false};let mut mac=HmacSha256::new_from_slice(key).expect("hmac");mac.update(data);mac.verify_slice(&tag).is_ok()}
 
 impl CompanionState {
-    pub fn start(&self) -> Result<(), String> {
-        // Bind before publishing a running state: a firewall/port conflict must not
-        // leave the desktop UI reporting a service that does not exist.
-        let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, COMPANION_PORT))
-            .map_err(|e| format!("Could not open CoreLink companion port: {e}"))?;
-        listener.set_nonblocking(true).map_err(|e| e.to_string())?;
-        {
-            let mut inner = self.0.lock().map_err(|_| "Companion state lock failed")?;
-            if inner.running {
-                return Ok(());
-            }
-            inner.running = true;
-        }
-        let state = self.clone();
-        thread::spawn(move || loop {
-            match listener.accept() {
-                Ok((stream, peer)) => {
-                    if local(peer.ip()) {
-                        let child = state.clone();
-                        thread::spawn(move || serve(stream, child));
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    if !state.running() {
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(100));
-                }
-                Err(_) => break,
-            }
-        });
-        Ok(())
-    }
-    pub fn stop(&self) {
-        if let Ok(mut i) = self.0.lock() {
-            i.running = false;
-            i.sessions.clear();
-            i.pending.clear();
-        }
-    }
-    fn running(&self) -> bool {
-        self.0.lock().map(|x| x.running).unwrap_or(false)
-    }
-    pub fn snapshot(&self) -> CompanionSnapshot {
-        let i = self.0.lock().unwrap();
-        CompanionSnapshot {
-            running: i.running,
-            port: COMPANION_PORT,
-            pending: i
-                .pending
-                .values()
-                .filter(|p| p.approved_code.is_none())
-                .map(|p| p.request.clone())
-                .collect(),
-            trusted_devices: i.trusted.values().cloned().collect(),
-        }
-    }
-    pub fn approve(&self, request_id: &str, code: String) -> Result<(), String> {
-        if code.len() != 6 || !code.bytes().all(|x| x.is_ascii_digit()) {
-            return Err("Enter the six-digit code shown in CoreLink Companion".into());
-        }
-        let mut i = self.0.lock().map_err(|_| "Companion state lock failed")?;
-        let p = i
-            .pending
-            .get_mut(request_id)
-            .ok_or("Pairing request expired")?;
-        p.approved_code = Some(code);
-        Ok(())
-    }
-    pub fn reject(&self, request_id: &str) -> Result<(), String> {
-        let mut i = self.0.lock().map_err(|_| "Companion state lock failed")?;
-        i.pending
-            .remove(request_id)
-            .map(|_| ())
-            .ok_or("Pairing request expired".into())
-    }
-    pub fn revoke(&self, id: &str) -> Result<(), String> {
-        let mut i = self.0.lock().map_err(|_| "Companion state lock failed")?;
-        i.sessions.remove(id);
-        i.trusted.remove(id);
-        Ok(())
-    }
+ pub fn start(&self)->Result<(),String>{let ip=lan_ip()?;let listener=TcpListener::bind((ip,COMPANION_PORT)).map_err(|e|format!("Could not bind CoreLink to {ip}: {e}"))?;listener.set_nonblocking(true).map_err(|e|e.to_string())?;{let mut i=self.0.lock().map_err(|_|"state lock")?;if i.running{return Ok(())};i.running=true;i.endpoint=Some(ip);i.enrollment=Some(Enrollment{token:random(),expires:Instant::now()+ENROLLMENT_TTL,expires_at:unix()+ENROLLMENT_TTL.as_secs(),used:false});}let state=self.clone();thread::spawn(move||loop{match listener.accept(){Ok((s,p))if private_peer(p.ip())=>{let state=state.clone();thread::spawn(move||serve(s,state));},Ok(_)=>{},Err(e)if e.kind()==std::io::ErrorKind::WouldBlock=>{if !state.running(){break};thread::sleep(Duration::from_millis(75))},Err(_)=>break}});Ok(())}
+ pub fn stop(&self){if let Ok(mut i)=self.0.lock(){i.running=false;i.enrollment=None;i.pending.clear();i.sessions.clear();}}
+ fn running(&self)->bool{self.0.lock().map(|i|i.running).unwrap_or(false)}
+ pub fn snapshot(&self)->CompanionSnapshot{let i=self.0.lock().expect("state");let(qr_payload,qr_svg_value,expires_at)=match(&i.enrollment,i.endpoint){(Some(e),Some(ip))if !e.used&&e.expires>Instant::now()=>{let v=format!("corelink://pair?v=2&host={ip}&port={COMPANION_PORT}&pin={}&token={}&expires={}",i.identity.pin,b64(e.token),e.expires_at);(Some(v.clone()),Some(qr_svg(&v)),Some(e.expires_at))},_=>(None,None,None)};CompanionSnapshot{running:i.running,port:COMPANION_PORT,pending:i.pending.values().map(|p|p.request.clone()).collect(),trusted_devices:i.trusted.iter().map(|(id,d)|TrustedDevice{device_id:id.clone(),name:d.name.clone()}).collect(),active_sessions:i.sessions.len(),qr_payload,qr_svg:qr_svg_value,expires_at}}
+ pub fn approve(&self,id:&str)->Result<(),String>{let mut i=self.0.lock().map_err(|_|"state lock")?;let Some(p)=i.pending.remove(id)else{return Err("Pairing request expired".into())};if p.created.elapsed()>ENROLLMENT_TTL{return Err("Pairing request expired".into())};i.trusted.insert(p.request.device_id,Device{name:p.request.name,secret:p.secret});Ok(())}
+ pub fn reject(&self,id:&str)->Result<(),String>{self.0.lock().map_err(|_|"state lock")?.pending.remove(id).map(|_|()).ok_or("Pairing request expired".into())}
+ pub fn revoke(&self,id:&str)->Result<(),String>{let mut i=self.0.lock().map_err(|_|"state lock")?;i.trusted.remove(id);i.sessions.remove(id);Ok(())}
 }
-
-fn serve(mut stream: TcpStream, state: CompanionState) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    let reader_stream = match stream.try_clone() {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    let mut reader = BufReader::new(reader_stream);
-    let mut raw = String::new();
-    if reader.read_line(&mut raw).is_err() {
-        return;
-    }
-    let msg: Message = match serde_json::from_str(&raw) {
-        Ok(m) => m,
-        Err(_) => {
-            let _ = line(
-                &mut stream,
-                &serde_json::json!({"type":"error","message":"invalid request"}),
-            );
-            return;
-        }
-    };
-    match msg {
-        Message::Hello => {
-            let nonce = state.0.lock().unwrap().pairing_nonce;
-            let _ = line(
-                &mut stream,
-                &serde_json::json!({"type":"hello","nonce":B64.encode(nonce),"port":COMPANION_PORT,"protocol":1}),
-            );
-        }
-        Message::PairRequest {
-            id,
-            name,
-            proof,
-            client_nonce,
-        } => pair(stream, state, id, name, proof, client_nonce),
-        Message::Input {
-            id,
-            nonce,
-            ciphertext,
-        } => {
-            let ok = decrypt_input(&state, &id, &nonce, &ciphertext)
-                .and_then(dispatch_input)
-                .is_ok();
-            let _ = line(&mut stream, &serde_json::json!({"type":"ack","ok":ok}));
-        }
-        Message::Disconnect { id } => {
-            if let Ok(mut i) = state.0.lock() {
-                i.sessions.remove(&id);
-            }
-            let _ = line(&mut stream, &serde_json::json!({"type":"disconnected"}));
-        }
-    }
-}
-fn pair(
-    mut stream: TcpStream,
-    state: CompanionState,
-    id: String,
-    name: String,
-    proof: String,
-    client_nonce: String,
-) {
-    if id.len() > 80 || name.len() > 80 || client_nonce.len() > 128 {
-        let _ = line(
-            &mut stream,
-            &serde_json::json!({"type":"error","message":"invalid pairing request"}),
-        );
-        return;
-    }
-    let request_id = text_id();
-    {
-        let mut i = state.0.lock().unwrap();
-        i.pending.insert(
-            request_id.clone(),
-            Pending {
-                request: PairRequest {
-                    id: id.clone(),
-                    name,
-                    request_id: request_id.clone(),
-                },
-                proof: proof.clone(),
-                client_nonce: client_nonce.clone(),
-                created: Instant::now(),
-                approved_code: None,
-            },
-        );
-    }
-    let _ = line(
-        &mut stream,
-        &serde_json::json!({"type":"approval_required","request_id":request_id}),
-    );
-    for _ in 0..180 {
-        thread::sleep(Duration::from_millis(500));
-        let result = {
-            let mut i = state.0.lock().unwrap();
-            let p = match i.pending.get(&request_id) {
-                Some(p) => p,
-                None => return,
-            };
-            if p.created.elapsed() > PAIRING_TTL {
-                i.pending.remove(&request_id);
-                None
-            } else if let Some(code) = p.approved_code.clone() {
-                let nonce = B64.encode(i.pairing_nonce);
-                let expected = expected_proof(&p.request.id, &code, &nonce, &p.client_nonce);
-                let key = digest(&[
-                    code.as_bytes(),
-                    nonce.as_bytes(),
-                    p.client_nonce.as_bytes(),
-                    p.request.id.as_bytes(),
-                ]);
-                let valid = p.proof == expected;
-                let device = p.request.name.clone();
-                i.pending.remove(&request_id);
-                if valid {
-                    i.sessions.insert(
-                        id.clone(),
-                        Session {
-                            key,
-                            expires: Instant::now() + SESSION_TTL,
-                            seen_nonces: HashSet::new(),
-                        },
-                    );
-                    i.trusted.insert(id.clone(), device);
-                    Some(B64.encode(digest(&[&key, b"server-confirm"])))
-                } else {
-                    None
-                }
-            } else {
-                continue;
-            }
-        };
-        if let Some(confirm) = result {
-            let _ = line(
-                &mut stream,
-                &serde_json::json!({"type":"paired","confirm":confirm,"expires_in":900}),
-            );
-        } else {
-            let _ = line(&mut stream, &serde_json::json!({"type":"rejected"}));
-        }
-        return;
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum Input {
-    Move {
-        dx: i32,
-        dy: i32,
-    },
-    Click {
-        button: String,
-    },
-    Scroll {
-        dy: i32,
-    },
-    Key {
-        key: String,
-        ctrl: bool,
-        alt: bool,
-        shift: bool,
-    },
-}
-fn decrypt_input(
-    state: &CompanionState,
-    id: &str,
-    nonce: &str,
-    ciphertext: &str,
-) -> Result<Input, String> {
-    let mut i = state.0.lock().map_err(|_| "lock")?;
-    let s = i.sessions.get_mut(id).ok_or("unpaired device")?;
-    if s.expires < Instant::now() {
-        return Err("session expired".into());
-    };
-    let n = B64.decode(nonce).map_err(|_| "nonce")?;
-    let c = B64.decode(ciphertext).map_err(|_| "ciphertext")?;
-    if n.len() != 12 {
-        return Err("nonce".into());
-    };
-    if !s.seen_nonces.insert(nonce.to_owned()) {
-        return Err("replayed input".into());
-    }
-    let cipher = Aes256Gcm::new_from_slice(&s.key).map_err(|_| "key")?;
-    let plain = cipher
-        .decrypt(Nonce::from_slice(&n), c.as_ref())
-        .map_err(|_| "authentication failed")?;
-    serde_json::from_slice(&plain).map_err(|_| "invalid input".into())
-}
-fn dispatch_input(input: Input) -> Result<(), String> {
-    match &input {
-        Input::Move { dx, dy } if dx.abs() > 5000 || dy.abs() > 5000 => {
-            Err("movement out of range".into())
-        }
-        Input::Scroll { dy } if dy.abs() > 5000 => Err("scroll out of range".into()),
-        Input::Click { button } if button != "left" && button != "right" => {
-            Err("button not allowed".into())
-        }
-        Input::Key { key, .. } if key.len() > 32 => Err("key not allowed".into()),
-        _ => send_windows_input(input),
-    }
-}
-#[cfg(windows)]
-fn send_windows_input(input: Input) -> Result<(), String> {
-    use windows::Win32::UI::Input::KeyboardAndMouse::{
-        keybd_event, mouse_event, KEYEVENTF_KEYUP, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
-        MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL,
-        VK_CONTROL, VK_MENU, VK_SHIFT,
-    };
-    unsafe {
-        match input {
-            Input::Move { dx, dy } => mouse_event(MOUSEEVENTF_MOVE, dx, dy, 0, 0),
-            Input::Scroll { dy } => mouse_event(MOUSEEVENTF_WHEEL, 0, 0, dy, 0),
-            Input::Click { button } => {
-                let (down, up) = if button == "left" {
-                    (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP)
-                } else {
-                    (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP)
-                };
-                mouse_event(down, 0, 0, 0, 0);
-                mouse_event(up, 0, 0, 0, 0);
-            }
-            Input::Key {
-                key,
-                ctrl,
-                alt,
-                shift,
-            } => {
-                if ctrl {
-                    keybd_event(VK_CONTROL.0 as u8, 0, Default::default(), 0);
-                }
-                if alt {
-                    keybd_event(VK_MENU.0 as u8, 0, Default::default(), 0);
-                }
-                if shift {
-                    keybd_event(VK_SHIFT.0 as u8, 0, Default::default(), 0);
-                }
-                for c in key.bytes() {
-                    if !c.is_ascii() {
-                        return Err("Only ASCII keyboard input is supported".into());
-                    }
-                    keybd_event(c.to_ascii_uppercase(), 0, Default::default(), 0);
-                    keybd_event(c.to_ascii_uppercase(), 0, KEYEVENTF_KEYUP, 0);
-                }
-                if shift {
-                    keybd_event(VK_SHIFT.0 as u8, 0, KEYEVENTF_KEYUP, 0);
-                }
-                if alt {
-                    keybd_event(VK_MENU.0 as u8, 0, KEYEVENTF_KEYUP, 0);
-                }
-                if ctrl {
-                    keybd_event(VK_CONTROL.0 as u8, 0, KEYEVENTF_KEYUP, 0);
-                }
-            }
-        }
-    }
-    Ok(())
-}
-#[cfg(not(windows))]
-fn send_windows_input(_input: Input) -> Result<(), String> {
-    Err("Windows input is unavailable on this platform".into())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn public_networks_are_rejected() {
-        assert!(!local("8.8.8.8".parse().unwrap()));
-        assert!(local("192.168.1.3".parse().unwrap()));
-    }
-    #[test]
-    fn input_bounds_are_enforced() {
-        assert!(dispatch_input(Input::Move { dx: 5001, dy: 0 }).is_err());
-        assert!(dispatch_input(Input::Click {
-            button: "middle".into()
-        })
-        .is_err());
-    }
-    #[test]
-    fn pairing_proof_requires_the_exact_code() {
-        let proof = expected_proof("android-1", "123456", "nonce", "client");
-        assert_eq!(
-            proof,
-            expected_proof("android-1", "123456", "nonce", "client")
-        );
-        assert_ne!(
-            proof,
-            expected_proof("android-1", "654321", "nonce", "client")
-        );
-    }
-    #[test]
-    fn stopping_service_clears_active_sessions() {
-        let state = CompanionState::default();
-        {
-            let mut inner = state.0.lock().unwrap();
-            inner.running = true;
-            inner.sessions.insert(
-                "phone".into(),
-                Session {
-                    key: [0; 32],
-                    expires: Instant::now() + SESSION_TTL,
-                    seen_nonces: HashSet::new(),
-                },
-            );
-        }
-        state.stop();
-        let snapshot = state.snapshot();
-        assert!(!snapshot.running);
-        assert!(snapshot.trusted_devices.is_empty());
-    }
-}
+#[derive(Deserialize)]#[serde(tag="type",rename_all="snake_case")]enum Request{Enroll{token:String,device_id:String,name:String},Input{device_id:String,sequence:u64,payload:Input,mac:String},Disconnect{device_id:String,sequence:u64,mac:String}}
+#[derive(Clone,Deserialize,Serialize)]#[serde(tag="kind",rename_all="snake_case")]pub enum Input{Move{dx:i32,dy:i32},Click{button:String},Scroll{dy:i32},Key{key:String,ctrl:bool,alt:bool,shift:bool},Text{text:String}}
+fn serve(socket:TcpStream,state:CompanionState){let config={let i=match state.0.lock(){Ok(v)=>v,Err(_)=>return};match server_config(&i.identity){Ok(v)=>v,Err(_)=>return}};let conn=match ServerConnection::new(config){Ok(v)=>v,Err(_)=>return};let mut tls=StreamOwned::new(conn,socket);let _=tls.sock.set_read_timeout(Some(Duration::from_secs(10)));let req={let mut reader=BufReader::new(&mut tls);read(&mut reader)};match req{Ok(Request::Enroll{token,device_id,name})=>enroll(&mut tls,state,token,device_id,name),Ok(Request::Input{device_id,sequence,payload,mac})=>input(&mut tls,state,device_id,sequence,payload,mac),Ok(Request::Disconnect{device_id,sequence,mac})=>disconnect(&mut tls,state,device_id,sequence,mac),Err(_)=>{}}}
+fn enroll<W:Write>(out:&mut W,state:CompanionState,token:String,id:String,name:String){if id.len()>96||name.len()>80{return};let Ok(token)=URL_SAFE_NO_PAD.decode(token)else{return};let request_id=b64(random::<16>());let secret=random();let accepted={let mut i=match state.0.lock(){Ok(v)=>v,Err(_)=>return};match i.enrollment.as_mut(){Some(e)if !e.used&&e.expires>Instant::now()&&token.as_slice()==e.token=>{e.used=true;i.pending.insert(request_id.clone(),Pending{request:PairRequest{request_id:request_id.clone(),name,device_id:id.clone()},secret,created:Instant::now()});true},_=>false}};if !accepted{let _=send(out,&serde_json::json!({"type":"rejected"}));return}let _=send(out,&serde_json::json!({"type":"approval_required","request_id":request_id}));for _ in 0..120{thread::sleep(Duration::from_millis(500));if state.0.lock().ok().and_then(|i|i.trusted.get(&id).map(|d|d.secret==secret)).unwrap_or(false){let _=send(out,&serde_json::json!({"type":"paired","secret":b64(secret),"session_ttl":SESSION_TTL.as_secs()}));return}}}
+fn input<W:Write>(out:&mut W,state:CompanionState,id:String,seq:u64,payload:Input,mac:String){let body=match serde_json::to_string(&payload){Ok(v)=>v,Err(_)=>return};let ok={let mut i=match state.0.lock(){Ok(v)=>v,Err(_)=>return};let Some(d)=i.trusted.get(&id)else{return};if !valid_mac(&d.secret,&transcript(&id,seq,"input",&body),&mac){false}else{let s=i.sessions.entry(id.clone()).or_insert(Session{last_sequence:0,expires:Instant::now()+SESSION_TTL});if seq<=s.last_sequence||s.expires<Instant::now(){false}else{s.last_sequence=seq;s.expires=Instant::now()+SESSION_TTL;dispatch(payload).is_ok()}}};let _=send(out,&serde_json::json!({"type":"ack","ok":ok}));}
+fn disconnect<W:Write>(out:&mut W,state:CompanionState,id:String,seq:u64,mac:String){let ok={let mut i=match state.0.lock(){Ok(v)=>v,Err(_)=>return};let Some(d)=i.trusted.get(&id)else{return};if valid_mac(&d.secret,&transcript(&id,seq,"disconnect",""),&mac){i.sessions.remove(&id);true}else{false}};let _=send(out,&serde_json::json!({"type":"disconnected","ok":ok}));}
+fn dispatch(input:Input)->Result<(),String>{match &input{Input::Move{dx,dy}if dx.abs()>5000||dy.abs()>5000=>Err("movement out of range".into()),Input::Scroll{dy}if dy.abs()>5000=>Err("scroll out of range".into()),Input::Click{button}if button!="left"&&button!="right"=>Err("button not allowed".into()),Input::Key{key,..}if key.len()>32=>Err("key not allowed".into()),Input::Text{text}if text.len()>2048=>Err("text too long".into()),_=>send_input(input)}}
+#[cfg(windows)]fn send_input(input:Input)->Result<(),String>{use windows::Win32::UI::Input::KeyboardAndMouse::{keybd_event,mouse_event,KEYEVENTF_KEYUP,MOUSEEVENTF_LEFTDOWN,MOUSEEVENTF_LEFTUP,MOUSEEVENTF_MOVE,MOUSEEVENTF_RIGHTDOWN,MOUSEEVENTF_RIGHTUP,MOUSEEVENTF_WHEEL,VK_CONTROL,VK_MENU,VK_SHIFT};unsafe{match input{Input::Move{dx,dy}=>mouse_event(MOUSEEVENTF_MOVE,dx,dy,0,0),Input::Scroll{dy}=>mouse_event(MOUSEEVENTF_WHEEL,0,0,dy,0),Input::Click{button}=>{let(d,u)=if button=="left"{(MOUSEEVENTF_LEFTDOWN,MOUSEEVENTF_LEFTUP)}else{(MOUSEEVENTF_RIGHTDOWN,MOUSEEVENTF_RIGHTUP)};mouse_event(d,0,0,0,0);mouse_event(u,0,0,0,0)},Input::Key{key,ctrl,alt,shift}=>{if ctrl{keybd_event(VK_CONTROL.0 as u8,0,Default::default(),0)}if alt{keybd_event(VK_MENU.0 as u8,0,Default::default(),0)}if shift{keybd_event(VK_SHIFT.0 as u8,0,Default::default(),0)}for c in key.bytes(){keybd_event(c.to_ascii_uppercase(),0,Default::default(),0);keybd_event(c.to_ascii_uppercase(),0,KEYEVENTF_KEYUP,0)}if shift{keybd_event(VK_SHIFT.0 as u8,0,KEYEVENTF_KEYUP,0)}if alt{keybd_event(VK_MENU.0 as u8,0,KEYEVENTF_KEYUP,0)}if ctrl{keybd_event(VK_CONTROL.0 as u8,0,KEYEVENTF_KEYUP,0)}},Input::Text{..}=>return Err("Unicode text injection is not yet supported".into())}};Ok(())}
+#[cfg(not(windows))]fn send_input(_:Input)->Result<(),String>{Err("Windows input unavailable".into())}
+#[cfg(test)]mod tests{use super::*;#[test]fn tampered_mac_fails(){let key=[1;32];let msg=transcript("d",1,"input","{}");let mut h=HmacSha256::new_from_slice(&key).unwrap();h.update(&msg);let mac=b64(h.finalize().into_bytes());assert!(valid_mac(&key,&msg,&mac));assert!(!valid_mac(&key,&transcript("d",2,"input","{}"),&mac));}#[test]fn bounds_hold(){assert!(dispatch(Input::Move{dx:5001,dy:0}).is_err());}}

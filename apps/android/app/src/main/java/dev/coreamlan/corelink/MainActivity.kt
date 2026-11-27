@@ -14,6 +14,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.platform.LocalContext
+import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
 import androidx.lifecycle.viewmodel.compose.viewModel
 import org.json.JSONObject
 
@@ -30,13 +32,18 @@ fun CoreLinkApp(vm: CompanionViewModel = viewModel()) {
     val ui by vm.ui.collectAsState()
     val orange = Color(0xffff8a19)
     var typed by rememberSaveable { mutableStateOf("") }
+    var qrPayload by rememberSaveable { mutableStateOf("") }
+    val context = LocalContext.current
     MaterialTheme(colorScheme = darkColorScheme(primary = orange, background = Color(0xff09090b), surface = Color(0xff18181b))) {
         Surface { Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().padding(22.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
             Text("CoreLink", style = MaterialTheme.typography.headlineMedium)
             Text("Windows companion", color = Color.LightGray)
             if (!ui.connected) {
-                Text("Secure pairing is not available yet", style = MaterialTheme.typography.titleMedium)
-                Text("The previous pairing method has been disabled while secure QR pairing is being developed.", style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
+                Text("Pair with your PC", style = MaterialTheme.typography.titleMedium)
+                Text("Start CoreLink Companion on Windows, scan its QR code, then approve this phone on the PC.", style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
+                Button({ GmsBarcodeScanning.getClient(context as ComponentActivity).startScan().addOnSuccessListener { qrPayload = it.rawValue.orEmpty() } }, modifier = Modifier.fillMaxWidth()) { Text("Scan CoreLink QR") }
+                OutlinedTextField(qrPayload, { qrPayload = it }, label = { Text("QR payload (manual fallback)") }, modifier = Modifier.fillMaxWidth(), minLines = 3)
+                Button({ vm.pair(context, qrPayload) }, modifier = Modifier.fillMaxWidth(), enabled = qrPayload.startsWith("corelink://pair")) { Text("Request pairing") }
             } else {
                 Text("Connected", color = Color(0xff4ade80))
                 Text("Touchpad", style = MaterialTheme.typography.titleLarge)

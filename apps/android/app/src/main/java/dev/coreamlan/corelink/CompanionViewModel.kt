@@ -1,6 +1,7 @@
 package dev.coreamlan.corelink
 
 import androidx.lifecycle.ViewModel
+import android.content.Context
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -17,13 +18,13 @@ class CompanionViewModel : ViewModel() {
     val ui = _ui.asStateFlow()
     private var client: CoreLinkClient? = null
     private var inputJob: Job? = null
-    fun pair(host: String, code: String) {
+    fun pair(context: Context, qrPayload: String) {
         if (_ui.value.busy) return
         _ui.value = CompanionUiState(busy = true, message = "Requesting desktop approval…")
         viewModelScope.launch {
             val result = withContext(Dispatchers.IO) {
-                val candidate = CoreLinkClient(host.trim())
-                candidate.pair(code, android.os.Build.MODEL).map { candidate }
+                val candidate = CoreLinkClient.fromQr(context, qrPayload)
+                candidate.pair(android.os.Build.MODEL).map { candidate }
             }
             result.onSuccess { candidate -> client = candidate; _ui.value = CompanionUiState(connected = true, message = "Connected") }
                 .onFailure { problem -> _ui.value = CompanionUiState(message = problem.message ?: "Pairing failed", error = true) }

@@ -92,9 +92,11 @@ git push -u origin main
 
 ## Phase 2 companion input
 
-`apps/android/` contains the native Kotlin + Jetpack Compose companion. Its touchpad connects only to an owner-started CoreLink companion service on a private LAN. Pairing is a short-lived six-digit proof plus explicit Windows approval; input packets use AES-256-GCM, expire after 15 minutes, and are validated before Windows input is sent. Stopping the service revokes all active sessions immediately.
+`apps/android/` contains the native Kotlin + Jetpack Compose companion. Start the secure companion from the Windows UI and scan its QR code with CoreLink Android. The QR carries a private-LAN endpoint, TLS certificate SHA-256 pin, a random 256-bit one-time enrollment credential, and a two-minute expiry. Android completes TLS 1.3 certificate pinning before it transmits the enrollment credential. Windows must explicitly approve the phone.
 
-The initial transport deliberately uses manual private-IP entry instead of pretending a PC was discovered. It does not capture a screen and it does not accept public-network connections. See [Companion setup](docs/COMPANION_SETUP.md) and the separate [Windows video streaming plan](docs/WINDOWS_VIDEO_STREAMING_PLAN.md).
+After approval, every input or disconnect request is HMAC-authenticated, sequence-numbered, bounded and checked against a 15-minute session. The service binds only to the selected private IPv4 interface; stopping it clears active sessions. Trusted devices can be revoked from the Windows UI. The old six-digit plaintext companion protocol is removed.
+
+This increment provides authenticated touchpad input only. It does not yet capture or stream the Windows desktop; the existing Android-to-Windows ADB/scrcpy mirroring remains separate. See [Companion setup](docs/COMPANION_SETUP.md) and the separate [Windows video streaming plan](docs/WINDOWS_VIDEO_STREAMING_PLAN.md).
 
 ### Android build
 
