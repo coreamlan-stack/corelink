@@ -393,6 +393,12 @@ pub enum Input {
     },
 }
 fn serve(socket: TcpStream, state: CompanionState) {
+    // Windows accepted sockets inherit the nonblocking listener mode. TLS reads
+    // must wait for the peer instead of treating WSAEWOULDBLOCK as a failure.
+    if let Err(error) = socket.set_nonblocking(false) {
+        eprintln!("CoreLink companion socket setup failed: {error}");
+        return;
+    }
     let c = {
         let i = match state.0.lock() {
             Ok(v) => v,

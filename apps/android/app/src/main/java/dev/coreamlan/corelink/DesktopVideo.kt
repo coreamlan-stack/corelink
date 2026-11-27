@@ -38,7 +38,8 @@ fun DesktopVideo(open: () -> Result<SSLSocket>, modifier: Modifier = Modifier) {
                 val input = DataInputStream(connection.inputStream)
                 val header = JSONObject(readHeader(input))
                 check(header.optString("type") == "video_started" && header.optString("format") == "bgra-zlib") {
-                    header.optString("message", "Windows capture is not available")
+                    if (header.optString("type") == "video_unavailable") "On your PC, start screen capture and choose a window or display. Then hide and show the PC screen to retry."
+                    else header.optString("message", "Windows capture is not available. Check that the companion and screen capture are running on your PC.")
                 }
                 val width = header.getInt("width")
                 val height = header.getInt("height")

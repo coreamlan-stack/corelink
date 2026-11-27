@@ -32,7 +32,8 @@ fun CoreLinkApp(vm: CompanionViewModel = viewModel()) {
     val ui by vm.ui.collectAsState()
     val orange = Color(0xffff8a19)
     var typed by rememberSaveable { mutableStateOf("") }
-    var qrPayload by rememberSaveable { mutableStateOf("") }
+    var scanning by remember { mutableStateOf(false) }
+    var scanError by remember { mutableStateOf("") }
     var showDesktop by rememberSaveable { mutableStateOf(false) }
     val context = LocalContext.current
     MaterialTheme(colorScheme = darkColorScheme(primary = orange, background = Color(0xff09090b), surface = Color(0xff18181b))) {
@@ -42,9 +43,19 @@ fun CoreLinkApp(vm: CompanionViewModel = viewModel()) {
             if (!ui.connected) {
                 Text("Pair with your PC", style = MaterialTheme.typography.titleMedium)
                 Text("Start CoreLink Companion on Windows, scan its QR code, then approve this phone on the PC.", style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
-                Button({ GmsBarcodeScanning.getClient(context as ComponentActivity).startScan().addOnSuccessListener { qrPayload = it.rawValue.orEmpty() } }, modifier = Modifier.fillMaxWidth()) { Text("Scan CoreLink QR") }
-                OutlinedTextField(qrPayload, { qrPayload = it }, label = { Text("QR payload (manual fallback)") }, modifier = Modifier.fillMaxWidth(), minLines = 3)
-                Button({ vm.pair(context, qrPayload) }, modifier = Modifier.fillMaxWidth(), enabled = qrPayload.startsWith("corelink://pair")) { Text("Request pairing") }
+                Button({
+                    scanError = ""
+                    scanning = true
+                    GmsBarcodeScanning.getClient(context as ComponentActivity).startScan()
+                        .addOnSuccessListener { barcode ->
+                            val value = barcode.rawValue
+                            if (value.isNullOrBlank()) scanError = "The QR code is empty. Please scan the code shown on your PC."
+                            else vm.pair(context, value)
+                        }
+                        .addOnFailureListener { scanError = "Could not scan the QR code. Please try again." }
+                        .addOnCompleteListener { scanning = false }
+                }, modifier = Modifier.fillMaxWidth(), enabled = !ui.busy && !scanning) { Text(if (ui.busy) "Waiting for PC approval…" else if (scanning) "Opening scanner…" else "Scan CoreLink QR") }
+                if (scanError.isNotEmpty()) Text(scanError, color = Color(0xfffca5a5))
             } else {
                 Text("Connected", color = Color(0xff4ade80))
                 OutlinedButton({ showDesktop = !showDesktop }, Modifier.fillMaxWidth()) { Text(if (showDesktop) "Hide PC screen" else "Show PC screen") }

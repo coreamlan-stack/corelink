@@ -225,6 +225,7 @@ fn capture(
         }
         let mut last_tick = unsafe { GetTickCount64() };
         let mut last_video = std::time::Instant::now() - Duration::from_secs(1);
+        let mut encoder = FrameEncoder::default();
         while !stop.load(Ordering::SeqCst) {
             let now = unsafe { GetTickCount64() };
             if now.saturating_sub(last_tick) > 5_000 {
@@ -234,22 +235,21 @@ fn capture(
             last_tick = now;
             if let Ok(frame) = pool.TryGetNextFrame() {
                 let next = frame.ContentSize()?;
-                if last_video.elapsed() >= Duration::from_millis(200)
+                if last_video.elapsed() >= Duration::from_millis(100)
                     && next.Width == size.Width
                     && next.Height == size.Height
                 {
-                    if let Ok(video) = encode_frame(
+                    let video = encoder.encode_frame(
                         &frame,
                         &d3d,
                         &context,
                         state.lock().unwrap().frames + 1,
                         &stop,
-                    ) {
-                        if !stop.load(Ordering::SeqCst) {
-                            if let Ok(mut slot) = VIDEO.get_or_init(|| Mutex::new(None)).lock() {
-                                if !stop.load(Ordering::SeqCst) {
-                                    *slot = Some(video);
-                                }
+                    )?;
+                    if !stop.load(Ordering::SeqCst) {
+                        if let Ok(mut slot) = VIDEO.get_or_init(|| Mutex::new(None)).lock() {
+                            if !stop.load(Ordering::SeqCst) {
+                                *slot = Some(video);
                             }
                         }
                     }
@@ -274,68 +274,113 @@ fn capture(
     run().map_err(|e| format!("Capture ended: {e}"))
 }
 
-fn encode_frame(
-    frame: &windows::Graphics::Capture::Direct3D11CaptureFrame,
-    device: &ID3D11Device,
-    context: &windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
-    number: u64,
-    stop: &Arc<AtomicBool>,
-) -> windows::core::Result<VideoFrame> {
-    let source: ID3D11Texture2D = unsafe {
-        frame
-            .Surface()?
-            .cast::<IDirect3DDxgiInterfaceAccess>()?
-            .GetInterface()?
-    };
-    let mut desc = D3D11_TEXTURE2D_DESC::default();
-    unsafe {
-        source.GetDesc(&mut desc);
+#[derive(Default)]
+struct FrameEncoder {
+    staging: Option<ID3D11Texture2D>,
+    source_desc: Option<D3D11_TEXTURE2D_DESC>,
+}
+
+fn scaled_size(width: u32, height: u32) -> (u32, u32) {
+    let numerator = 960_u64 * u64::from(height);
+    let denominator = 540_u64 * u64::from(width);
+    if width <= 960 && height <= 540 {
+        (width, height)
+    } else if numerator <= denominator {
+        (
+            960,
+            ((u64::from(height) * 960) / u64::from(width)).max(1) as u32,
+        )
+    } else {
+        (
+            ((u64::from(width) * 540) / u64::from(height)).max(1) as u32,
+            540,
+        )
     }
-    if desc.Width == 0 || desc.Height == 0 || desc.Width > 16384 || desc.Height > 16384 {
-        return Err(windows::core::Error::from_win32());
-    }
-    desc.Usage = D3D11_USAGE_STAGING;
-    desc.BindFlags = 0;
-    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
-    desc.MiscFlags = 0;
-    let mut staging = None;
-    unsafe {
-        device.CreateTexture2D(&desc, None, Some(&mut staging))?;
-    }
-    let staging = staging.unwrap();
-    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-    unsafe {
-        context.CopyResource(&staging, &source);
-        context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
-    }
-    let scale = ((desc.Width + 959) / 960)
-        .max((desc.Height + 539) / 540)
-        .max(1);
-    let width = (desc.Width / scale).max(1);
-    let height = (desc.Height / scale).max(1);
-    let mut raw = Vec::with_capacity((width * height * 4) as usize);
-    unsafe {
-        for y in 0..height {
-            let row = (mapped.pData as *const u8).add((y * scale * mapped.RowPitch) as usize);
-            for x in 0..width {
-                let pixel = std::slice::from_raw_parts(row.add((x * scale * 4) as usize), 4);
-                raw.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
-            }
+}
+
+impl FrameEncoder {
+    fn encode_frame(
+        &mut self,
+        frame: &windows::Graphics::Capture::Direct3D11CaptureFrame,
+        device: &ID3D11Device,
+        context: &windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
+        number: u64,
+        stop: &Arc<AtomicBool>,
+    ) -> windows::core::Result<VideoFrame> {
+        let source: ID3D11Texture2D = unsafe {
+            frame
+                .Surface()?
+                .cast::<IDirect3DDxgiInterfaceAccess>()?
+                .GetInterface()?
+        };
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe {
+            source.GetDesc(&mut desc);
         }
-        context.Unmap(&staging, 0);
+        if desc.Width == 0 || desc.Height == 0 || desc.Width > 16384 || desc.Height > 16384 {
+            return Err(windows::core::Error::from_win32());
+        }
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.BindFlags = 0;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+        desc.MiscFlags = 0;
+        if self.source_desc != Some(desc) {
+            let mut staging = None;
+            unsafe {
+                device.CreateTexture2D(&desc, None, Some(&mut staging))?;
+            }
+            self.staging = staging;
+            self.source_desc = Some(desc);
+        }
+        let staging = self
+            .staging
+            .as_ref()
+            .ok_or_else(windows::core::Error::from_win32)?;
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        unsafe {
+            context.CopyResource(staging, &source);
+            context.Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+        }
+        let (width, height) = scaled_size(desc.Width, desc.Height);
+        let mut raw = Vec::with_capacity((width * height * 4) as usize);
+        unsafe {
+            for y in 0..height {
+                let source_y = (u64::from(y) * u64::from(desc.Height) / u64::from(height)) as usize;
+                let row = (mapped.pData as *const u8).add(source_y * mapped.RowPitch as usize);
+                for x in 0..width {
+                    let source_x =
+                        (u64::from(x) * u64::from(desc.Width) / u64::from(width)) as usize;
+                    let pixel = std::slice::from_raw_parts(row.add(source_x * 4), 4);
+                    raw.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
+                }
+            }
+            context.Unmap(staging, 0);
+        }
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+        encoder
+            .write_all(&raw)
+            .map_err(|_| windows::core::Error::from_win32())?;
+        let data = encoder
+            .finish()
+            .map_err(|_| windows::core::Error::from_win32())?;
+        Ok(VideoFrame {
+            width,
+            height,
+            number,
+            data: Arc::new(data),
+            owner: Arc::downgrade(stop),
+        })
     }
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
-    encoder
-        .write_all(&raw)
-        .map_err(|_| windows::core::Error::from_win32())?;
-    let data = encoder
-        .finish()
-        .map_err(|_| windows::core::Error::from_win32())?;
-    Ok(VideoFrame {
-        width,
-        height,
-        number,
-        data: Arc::new(data),
-        owner: Arc::downgrade(stop),
-    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scaled_size;
+    #[test]
+    fn scales_to_fit_without_upscaling_or_distorting_the_source() {
+        assert_eq!(scaled_size(1920, 1080), (960, 540));
+        assert_eq!(scaled_size(1280, 720), (960, 540));
+        assert_eq!(scaled_size(1080, 1920), (303, 540));
+        assert_eq!(scaled_size(640, 480), (640, 480));
+    }
 }
