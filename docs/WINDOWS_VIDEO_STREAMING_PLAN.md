@@ -12,6 +12,7 @@ Video streaming is intentionally not enabled by the touchpad service. Screen cap
 
 ## Milestones and verification
 
+- A local capture prototype is present: choose a source in the Windows picker, count captured frames, and stop manually or on source closure. It does not transmit frames. Interactive Windows verification and sleep/resume handling are still required before this milestone is complete.
 - Prototype Windows Graphics Capture with consent, selected-source indicator, sleep/resume handling and no remote transport.
 - Add hardware encoder telemetry and verify hardware selection on NVIDIA, Intel and AMD devices; measure encode latency/CPU.
 - Add pinned QUIC transport and Android `MediaCodec` decode; test loss, roaming and Wi-Fi recovery.

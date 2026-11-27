@@ -9,6 +9,7 @@ use tauri::State;
 use tauri_plugin_autostart::MacosLauncher;
 use wait_timeout::ChildExt;
 mod companion;
+mod capture;
 use companion::{CompanionSnapshot, CompanionState};
 
 #[derive(Default)]
@@ -318,6 +319,12 @@ fn companion_snapshot(state: State<'_, CompanionState>) -> CompanionSnapshot {
 }
 
 #[tauri::command]
+fn regenerate_companion_qr(state: State<'_, CompanionState>) -> Result<CompanionSnapshot, String> {
+    state.regenerate_enrollment()?;
+    Ok(state.snapshot())
+}
+
+#[tauri::command]
 fn approve_companion_pairing(
     request_id: String,
     state: State<'_, CompanionState>,
@@ -344,10 +351,23 @@ fn revoke_companion_device(
     Ok(state.snapshot())
 }
 
+#[tauri::command]
+fn capture_snapshot(state: State<'_, capture::CaptureState>) -> capture::CaptureSnapshot {
+    state.clear_finished(); state.snapshot()
+}
+#[tauri::command]
+fn start_capture(window: tauri::WebviewWindow, state: State<'_, capture::CaptureState>) -> Result<(), String> {
+    state.clear_finished();
+    state.start(window.hwnd().map_err(|e| e.to_string())?.0 as isize)
+}
+#[tauri::command]
+fn stop_capture(state: State<'_, capture::CaptureState>) { state.stop(); }
+
 pub fn run() {
     tauri::Builder::default()
         .manage(MirrorState::default())
         .manage(CompanionState::default())
+        .manage(capture::CaptureState::default())
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
             None,
@@ -361,9 +381,11 @@ pub fn run() {
             start_companion_service,
             stop_companion_service,
             companion_snapshot,
+            regenerate_companion_qr,
             approve_companion_pairing,
             reject_companion_pairing,
-            revoke_companion_device
+            revoke_companion_device,
+            capture_snapshot, start_capture, stop_capture
         ])
         .run(tauri::generate_context!())
         .expect("Failed to start CoreLink");

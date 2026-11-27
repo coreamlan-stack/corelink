@@ -33,6 +33,7 @@ fun CoreLinkApp(vm: CompanionViewModel = viewModel()) {
     val orange = Color(0xffff8a19)
     var typed by rememberSaveable { mutableStateOf("") }
     var qrPayload by rememberSaveable { mutableStateOf("") }
+    var showDesktop by rememberSaveable { mutableStateOf(false) }
     val context = LocalContext.current
     MaterialTheme(colorScheme = darkColorScheme(primary = orange, background = Color(0xff09090b), surface = Color(0xff18181b))) {
         Surface { Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().padding(22.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
@@ -46,6 +47,10 @@ fun CoreLinkApp(vm: CompanionViewModel = viewModel()) {
                 Button({ vm.pair(context, qrPayload) }, modifier = Modifier.fillMaxWidth(), enabled = qrPayload.startsWith("corelink://pair")) { Text("Request pairing") }
             } else {
                 Text("Connected", color = Color(0xff4ade80))
+                OutlinedButton({ showDesktop = !showDesktop }, Modifier.fillMaxWidth()) { Text(if (showDesktop) "Hide PC screen" else "Show PC screen") }
+                if (showDesktop) {
+                    DesktopVideo(open = { vm.openVideo() }, modifier = Modifier.fillMaxWidth().height(190.dp).background(Color.Black, RoundedCornerShape(12.dp)))
+                }
                 Text("Touchpad", style = MaterialTheme.typography.titleLarge)
                 Box(Modifier.fillMaxWidth().weight(1f).background(Color(0xff27272a), RoundedCornerShape(18.dp)).pointerInput(Unit) {
                     detectDragGestures { _, drag -> vm.input(JSONObject().put("kind", "move").put("dx", drag.x.toInt()).put("dy", drag.y.toInt())) }
@@ -55,7 +60,7 @@ fun CoreLinkApp(vm: CompanionViewModel = viewModel()) {
                     OutlinedButton({ vm.input(JSONObject().put("kind", "click").put("button", "right")) }, Modifier.weight(1f)) { Text("Right click") }
                 }
                 OutlinedTextField(typed, { text ->
-                    if (text.isNotEmpty()) { vm.input(JSONObject().put("kind", "key").put("key", text.takeLast(1)).put("ctrl", false).put("alt", false).put("shift", false)); typed = "" }
+                    if (text.isNotEmpty()) { vm.input(JSONObject().put("kind", "text").put("text", text)); typed = "" }
                 }, label = { Text("Type to PC") }, modifier = Modifier.fillMaxWidth())
                 Button({ vm.disconnect() }, Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = Color(0xffb91c1c))) { Text("Disconnect now") }
             }

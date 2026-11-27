@@ -8,7 +8,9 @@ and unauthenticated disconnects.
 
 Android mirroring through ADB and scrcpy is separate and remains available.
 The companion currently supports bounded authenticated pointer, click, scroll
-and ASCII shortcut messages. It does not capture or stream the Windows desktop.
+and text messages. The experimental screen preview sends compressed frames over
+an authenticated, certificate-pinned TLS connection after the Windows user
+chooses a source. Its 960×540, 5 fps limit is intended for early testing.
 
 Windows input is subject to integrity levels and cannot bypass the secure desktop,
 lock screen, or UAC restrictions. A future local-network service may require a

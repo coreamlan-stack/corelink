@@ -1,6 +1,6 @@
 # CoreLink · Windows ↔ Samsung (Phase 1)
 
-A real, local-first Windows desktop workspace for mirroring and controlling Android phones using **ADB + scrcpy**. Written with **Tauri 2, Rust, React JSX and Tailwind CSS 4**. This is Phase 1 only: PC control from phone is **not implemented**.
+A local-first Windows workspace for Android mirroring with **ADB + scrcpy**, plus an experimental Android companion for viewing and controlling Windows. Written with **Tauri 2, Rust, React JSX and Tailwind CSS 4**.
 
 ## What works
 
@@ -96,7 +96,7 @@ git push -u origin main
 
 After approval, every input or disconnect request is HMAC-authenticated, sequence-numbered, bounded and checked against a 15-minute session. The service binds only to the selected private IPv4 interface; stopping it clears active sessions. Trusted devices can be revoked from the Windows UI. The old six-digit plaintext companion protocol is removed.
 
-This increment provides authenticated touchpad input only. It does not yet capture or stream the Windows desktop; the existing Android-to-Windows ADB/scrcpy mirroring remains separate. See [Companion setup](docs/COMPANION_SETUP.md) and the separate [Windows video streaming plan](docs/WINDOWS_VIDEO_STREAMING_PLAN.md).
+The experimental Windows-to-phone preview uses an opt-in source picker and a pinned, authenticated TLS connection. It currently sends compressed frames at up to 960×540 and 5 fps; this is a prototype, not the planned H.264/QUIC stream. The existing Android-to-Windows ADB/scrcpy mirroring remains separate. See [Companion setup](docs/COMPANION_SETUP.md) and the [Windows video streaming plan](docs/WINDOWS_VIDEO_STREAMING_PLAN.md).
 
 ### Android build
 

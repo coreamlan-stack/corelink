@@ -7,13 +7,14 @@ import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.OutputStreamWriter
 import java.net.URI
+import java.net.InetSocketAddress
 import java.security.MessageDigest
 import java.security.SecureRandom
+import java.util.Base64
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLSocket
-import android.util.Base64
 
 /** Parsed only from an out-of-band CoreLink QR code. No plaintext transport exists. */
 data class QrEnrollment(val host: String, val port: Int, val pin: ByteArray, val token: String, val expiresAt: Long) {
@@ -26,10 +27,10 @@ data class QrEnrollment(val host: String, val port: Int, val pin: ByteArray, val
             val host = query["host"] ?: error("QR code has no endpoint")
             val port = query["port"]?.toIntOrNull()?.takeIf { it in 1..65535 } ?: error("Invalid QR port")
             require(isPrivateIpv4(host)) { "CoreLink only connects to private IPv4 addresses" }
-            val pin = Base64.decode(query["pin"] ?: error("QR code has no certificate pin"), Base64.URL_SAFE or Base64.NO_WRAP)
+            val pin = Base64.getUrlDecoder().decode(query["pin"] ?: error("QR code has no certificate pin"))
             require(pin.size == 32) { "Invalid certificate pin" }
             val token = query["token"] ?: error("QR code has no enrollment credential")
-            require(Base64.decode(token, Base64.URL_SAFE or Base64.NO_WRAP).size == 32) { "Invalid enrollment credential" }
+            require(Base64.getUrlDecoder().decode(token).size == 32) { "Invalid enrollment credential" }
             val expiry = query["expires"]?.toLongOrNull() ?: error("QR code has no expiration")
             require(expiry > System.currentTimeMillis() / 1000) { "This QR code has expired" }
             return QrEnrollment(host, port, pin, token, expiry)
@@ -49,8 +50,10 @@ class CoreLinkClient private constructor(private val context: Context, private v
     private var sessionId: String? = null
     private var sessionKey: ByteArray? = null
 
-    fun pair(name: String): Result<Unit> = runCatching {
-        check(secret == null) { "This PC is already paired; connect from the dashboard." }
+    @Synchronized fun pair(name: String): Result<Unit> = runCatching {
+        // A fresh one-time QR and desktop approval allow pairing again after the
+        // desktop restarts or revokes an earlier credential. Keep the old
+        // credential until the replacement has been approved successfully.
         exchange(JSONObject().put("type", "enroll").put("token", enrollment.token).put("device_id", deviceId).put("name", name)) { response ->
             check(response.current.optString("type") == "approval_required") { "Pairing was rejected" }
             // The TLS connection remains open while the desktop owner decides.
@@ -61,17 +64,35 @@ class CoreLinkClient private constructor(private val context: Context, private v
         }
     }
 
-    fun input(body: JSONObject): Result<Unit> = runCatching {
+    @Synchronized fun input(body: JSONObject): Result<Unit> = runCatching {
         val session = ensureSession(); val seq = nextSequence()
         val payload = body.toString(); val tag = sign(session.key, transcript("input", session.id, seq.toString(), payload))
-        exchange(JSONObject().put("type", "input").put("session_id", session.id).put("sequence", seq).put("payload", body).put("mac", tag)) { response ->
+        exchange(JSONObject().put("type", "input").put("session_id", session.id).put("sequence", seq).put("payload", payload).put("mac", tag)) { response ->
             check(response.current.optString("type") == "ack" && response.current.optBoolean("ok")) { "Desktop rejected this control" }
         }
-    }
-    fun disconnect() {
+    }.onFailure { sessionId = null; sessionKey = null; sequence = 0 }
+    @Synchronized fun disconnect() {
         val session = sessionId?.let { id -> sessionKey?.let { key -> Session(id, key) } } ?: return
         runCatching { val seq=nextSequence(); exchange(JSONObject().put("type","disconnect").put("session_id",session.id).put("sequence",seq).put("mac",sign(session.key,transcript("disconnect",session.id,seq.toString())))) { response -> check(response.current.optBoolean("ok")) } }
         sessionId = null; sessionKey = null; sequence = 0
+    }
+
+    /** Caller owns the socket and must close it on disconnect. */
+    @Synchronized fun openVideo(): Result<SSLSocket> = runCatching {
+        val session = ensureSession()
+        val nonce = encode(ByteArray(32).also { SecureRandom().nextBytes(it) })
+        val socket = openSocket()
+        try {
+            val request = JSONObject().put("type", "video_open").put("session_id", session.id)
+                .put("nonce", nonce).put("mac", sign(session.key, transcript("video-open", session.id, nonce)))
+            val writer = OutputStreamWriter(socket.outputStream, Charsets.UTF_8)
+            writer.write(request.toString() + "\n")
+            writer.flush()
+            socket
+        } catch (error: Exception) {
+            socket.close()
+            throw error
+        }
     }
 
     private fun ensureSession(): Session {
@@ -95,16 +116,23 @@ class CoreLinkClient private constructor(private val context: Context, private v
     }
 
     private fun exchange(request: JSONObject, consume: (Response) -> Unit) {
-        val ssl = SSLContext.getInstance("TLS").apply { init(null, arrayOf(PinnedServerTrustManager(enrollment.pin)), SecureRandom()) }
-        (ssl.socketFactory.createSocket(enrollment.host, enrollment.port) as SSLSocket).use { socket ->
-            socket.enabledProtocols = arrayOf("TLSv1.3")
-            socket.soTimeout = 65_000
-            socket.startHandshake() // pin is checked before the enrollment token is written.
+        openSocket().use { socket ->
             val writer = OutputStreamWriter(socket.outputStream, Charsets.UTF_8); writer.write(request.toString() + "\n"); writer.flush()
             val reader = BufferedReader(socket.inputStream.reader(Charsets.UTF_8)); val first=JSONObject(reader.readLine() ?: error("Desktop closed the connection"))
             val second = if (first.optString("type") == "approval_required") JSONObject(reader.readLine() ?: error("Pairing timed out")) else null
             consume(Response(first, second))
         }
+    }
+    private fun openSocket(): SSLSocket {
+        val ssl = SSLContext.getInstance("TLS").apply { init(null, arrayOf(PinnedServerTrustManager(enrollment.pin)), SecureRandom()) }
+        val socket = ssl.socketFactory.createSocket() as SSLSocket
+        try {
+            socket.connect(InetSocketAddress(enrollment.host, enrollment.port), 10_000)
+            socket.enabledProtocols = arrayOf("TLSv1.3")
+            socket.soTimeout = 65_000
+            socket.startHandshake() // Pin is checked before credentials are sent.
+            return socket
+        } catch (error: Exception) { socket.close(); throw error }
     }
     private fun nextSequence(): Long { sequence += 1; return sequence }
     private fun transcript(vararg parts: String) = (listOf("corelink-v3") + parts).joinToString("\n").toByteArray(Charsets.UTF_8)
@@ -117,7 +145,7 @@ class CoreLinkClient private constructor(private val context: Context, private v
         fun initialize(context: Context) { secureStore(context) }
         private fun secureStore(context: Context) = EncryptedSharedPreferences.create(context, "corelink_credentials", MasterKey.Builder(context).setKeyScheme(MasterKey.KeyScheme.AES256_GCM).build(), EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV, EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM)
         private fun randomId(): String { val b=ByteArray(16);SecureRandom().nextBytes(b);return encode(b) }
-        private fun encode(value: ByteArray) = Base64.encodeToString(value, Base64.URL_SAFE or Base64.NO_WRAP)
-        private fun decode(value: String) = Base64.decode(value, Base64.URL_SAFE or Base64.NO_WRAP)
+        private fun encode(value: ByteArray) = Base64.getUrlEncoder().withoutPadding().encodeToString(value)
+        private fun decode(value: String) = Base64.getUrlDecoder().decode(value)
     }
 }
