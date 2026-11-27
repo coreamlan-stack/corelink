@@ -301,9 +301,9 @@ fn start_companion_service(state: State<'_, CompanionState>) -> Result<Companion
     start_companion(&state)
 }
 
-fn start_companion(_state: &CompanionState) -> Result<CompanionSnapshot, String> {
-    _state.start()?;
-    Ok(_state.snapshot())
+fn start_companion(state: &CompanionState) -> Result<CompanionSnapshot, String> {
+    state.start()?;
+    Ok(state.snapshot())
 }
 
 #[tauri::command]

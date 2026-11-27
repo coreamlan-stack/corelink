@@ -22,7 +22,7 @@ data class QrEnrollment(val host: String, val port: Int, val pin: ByteArray, val
             val uri = URI(value)
             require(uri.scheme == "corelink" && uri.host == "pair") { "Not a CoreLink pairing QR code" }
             val query = uri.rawQuery.split("&").associate { val p = it.split("=", limit = 2); p[0] to p.getOrElse(1) { "" } }
-            require(query["v"] == "2") { "Unsupported CoreLink protocol" }
+            require(query["v"] == "3") { "Unsupported CoreLink protocol" }
             val host = query["host"] ?: error("QR code has no endpoint")
             val port = query["port"]?.toIntOrNull()?.takeIf { it in 1..65535 } ?: error("Invalid QR port")
             require(isPrivateIpv4(host)) { "CoreLink only connects to private IPv4 addresses" }
@@ -45,7 +45,9 @@ class CoreLinkClient private constructor(private val context: Context, private v
     private val store by lazy { secureStore(context) }
     private val deviceId get() = store.getString("device_id", null) ?: randomId().also { store.edit().putString("device_id", it).apply() }
     private var secret: ByteArray? = store.getString("secret_${enrollment.host}_${enrollment.port}", null)?.let { decode(it) }
-    private var sequence = store.getLong("sequence_${enrollment.host}_${enrollment.port}", 0)
+    private var sequence = 0L
+    private var sessionId: String? = null
+    private var sessionKey: ByteArray? = null
 
     fun pair(name: String): Result<Unit> = runCatching {
         check(secret == null) { "This PC is already paired; connect from the dashboard." }
@@ -60,13 +62,37 @@ class CoreLinkClient private constructor(private val context: Context, private v
     }
 
     fun input(body: JSONObject): Result<Unit> = runCatching {
-        val key = checkNotNull(secret) { "Pair with this PC first" }; val seq = nextSequence()
-        val payload = body.toString(); val tag = sign(key, transcript(seq, "input", payload))
-        exchange(JSONObject().put("type", "input").put("device_id", deviceId).put("sequence", seq).put("payload", body).put("mac", tag)) { response ->
+        val session = ensureSession(); val seq = nextSequence()
+        val payload = body.toString(); val tag = sign(session.key, transcript("input", session.id, seq.toString(), payload))
+        exchange(JSONObject().put("type", "input").put("session_id", session.id).put("sequence", seq).put("payload", body).put("mac", tag)) { response ->
             check(response.current.optString("type") == "ack" && response.current.optBoolean("ok")) { "Desktop rejected this control" }
         }
     }
-    fun disconnect() { val key = secret ?: return; runCatching { val seq=nextSequence(); exchange(JSONObject().put("type","disconnect").put("device_id",deviceId).put("sequence",seq).put("mac",sign(key,transcript(seq,"disconnect","")))) { } }; secret = null }
+    fun disconnect() {
+        val session = sessionId?.let { id -> sessionKey?.let { key -> Session(id, key) } } ?: return
+        runCatching { val seq=nextSequence(); exchange(JSONObject().put("type","disconnect").put("session_id",session.id).put("sequence",seq).put("mac",sign(session.key,transcript("disconnect",session.id,seq.toString())))) { response -> check(response.current.optBoolean("ok")) } }
+        sessionId = null; sessionKey = null; sequence = 0
+    }
+
+    private fun ensureSession(): Session {
+        val existing = sessionId?.let { id -> sessionKey?.let { key -> Session(id, key) } }
+        if (existing != null) return existing
+        val deviceKey = checkNotNull(secret) { "Pair with this PC first" }
+        val nonce = ByteArray(32).also { SecureRandom().nextBytes(it) }
+        val clientNonce = encode(nonce)
+        var opened: Session? = null
+        exchange(JSONObject().put("type", "session_open").put("device_id", deviceId).put("client_nonce", clientNonce).put("mac", sign(deviceKey, transcript("session-open", deviceId, clientNonce)))) { response ->
+            val value = response.current
+            check(value.optString("type") == "session_opened") { "Desktop rejected this session" }
+            val id = value.getString("session_id")
+            val serverNonce = value.getString("server_nonce")
+            val key = deriveSessionKey(deviceKey, id, clientNonce, serverNonce)
+            val proof = value.getString("mac")
+            check(MessageDigest.isEqual(decode(proof), decode(sign(key, transcript("session-opened", deviceId, id, serverNonce))))) { "Desktop session proof failed" }
+            opened = Session(id, key)
+        }
+        return checkNotNull(opened).also { sessionId = it.id; sessionKey = it.key; sequence = 0 }
+    }
 
     private fun exchange(request: JSONObject, consume: (Response) -> Unit) {
         val ssl = SSLContext.getInstance("TLS").apply { init(null, arrayOf(PinnedServerTrustManager(enrollment.pin)), SecureRandom()) }
@@ -80,9 +106,11 @@ class CoreLinkClient private constructor(private val context: Context, private v
             consume(Response(first, second))
         }
     }
-    private fun nextSequence(): Long { sequence += 1; store.edit().putLong("sequence_${enrollment.host}_${enrollment.port}", sequence).commit(); return sequence }
-    private fun transcript(seq: Long, kind: String, payload: String) = "corelink-v2\n$deviceId\n$seq\n$kind\n$payload".toByteArray()
+    private fun nextSequence(): Long { sequence += 1; return sequence }
+    private fun transcript(vararg parts: String) = (listOf("corelink-v3") + parts).joinToString("\n").toByteArray(Charsets.UTF_8)
     private fun sign(key: ByteArray, data: ByteArray): String { val mac=Mac.getInstance("HmacSHA256");mac.init(SecretKeySpec(key,"HmacSHA256"));return encode(mac.doFinal(data)) }
+    private fun deriveSessionKey(deviceKey: ByteArray, id: String, clientNonce: String, serverNonce: String): ByteArray { val mac=Mac.getInstance("HmacSHA256");mac.init(SecretKeySpec(deviceKey,"HmacSHA256"));return mac.doFinal(transcript("session-key",id,clientNonce,serverNonce)) }
+    private data class Session(val id: String, val key: ByteArray)
     private data class Response(val current: JSONObject, val next: JSONObject?)
     companion object {
         fun fromQr(context: Context, qr: String) = CoreLinkClient(context.applicationContext, QrEnrollment.parse(qr))
