@@ -23,6 +23,7 @@ class CompanionViewModel : ViewModel() {
     private var initialized = false
     private var foreground = false
     private var autoReconnect = true
+    private var appContext: Context? = null
     private var inputJob: Job? = null
     private val inputQueue = OrderedMoveQueue<JSONObject>(
         move = { if (it.optString("kind") == "move") it.optInt("dx") to it.optInt("dy") else null },
@@ -69,9 +70,11 @@ class CompanionViewModel : ViewModel() {
         if (initialized) return
         initialized = true
         val app = context.applicationContext
+        appContext = app
         viewModelScope.launch {
             val saved = withContext(Dispatchers.IO) { runCatching { CoreLinkClient.fromSaved(app) != null }.getOrDefault(false) }
             _ui.value = _ui.value.copy(hasSavedPc = saved)
+            if (saved && foreground && autoReconnect) reconnect(app)
             while (true) {
                 if (foreground && autoReconnect && _ui.value.hasSavedPc && !_ui.value.busy) {
                     val active = client
@@ -88,7 +91,10 @@ class CompanionViewModel : ViewModel() {
             }
         }
     }
-    fun setForeground(value: Boolean) { foreground = value }
+    fun setForeground(value: Boolean) {
+        foreground = value
+        if (value && autoReconnect && _ui.value.hasSavedPc) appContext?.let { reconnect(it) }
+    }
     fun reconnect(context: Context) {
         if (_ui.value.busy || _ui.value.connected) return
         autoReconnect = true
@@ -104,7 +110,7 @@ class CompanionViewModel : ViewModel() {
                     _ui.value = _ui.value.copy(busy = false, message = "")
                 }
             }
-                .onFailure { problem -> _ui.value = _ui.value.copy(busy = false, message = problem.message ?: "Could not connect to the saved PC", error = true) }
+                .onFailure { _ui.value = _ui.value.copy(busy = false, message = if (autoReconnect && foreground) "PC not found yet. Trying again automatically…" else "Disconnected", error = false) }
         }
     }
     fun input(value: JSONObject) {
@@ -117,10 +123,10 @@ class CompanionViewModel : ViewModel() {
     fun openAudio(): Result<SSLSocket> = client?.openAudio() ?: Result.failure(IllegalStateException("Pair with this PC first"))
     fun disconnect() {
         autoReconnect = false
-        val old = client ?: return
+        val old = client
         client = null
         inputQueue.clear()
-        viewModelScope.launch(Dispatchers.IO) { old.disconnect() }
+        if (old != null) viewModelScope.launch(Dispatchers.IO) { old.disconnect() }
         _ui.value = CompanionUiState(message = "Disconnected", hasSavedPc = true)
     }
     override fun onCleared() { disconnect(); super.onCleared() }

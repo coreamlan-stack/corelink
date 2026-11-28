@@ -33,11 +33,11 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import org.json.JSONObject
 
-private val RemoteBackground = Color(0xff0c0d10)
+private val RemoteBackground = Color(0xff09090b)
 private val RemoteSurface = Color(0xff181a1e)
 private val RemoteBorder = Color(0xff303238)
 private val RemoteMuted = Color(0xffa1a2aa)
-private val RemoteOrange = Color(0xffff942c)
+private val RemoteOrange = Color(0xffff7900)
 
 @Composable
 fun RemoteDashboard(vm: CompanionViewModel, ui: CompanionUiState, onViewPc: () -> Unit) {

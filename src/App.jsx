@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { enable, isEnabled } from '@tauri-apps/plugin-autostart';
 import { MonitorSmartphone, Wifi, Usb, RefreshCcw, Play, Square, Settings2, Smartphone, Terminal, Power, LockKeyhole, MousePointer2 } from 'lucide-react';
 import { validEndpoint, normalizeDeviceState } from './validation.js';
+import corelinkLogo from './corelink-icon.png';
 
 const INITIAL = { adb: { found: false, path: null }, scrcpy: { found: false, path: null }, devices: [], mirroring: false };
 const errorMessage = (error) => typeof error === 'string' ? error : (error?.message || String(error));
@@ -77,7 +78,7 @@ export default function App() {
   return (
     <div className="min-h-screen bg-[#09090b] text-zinc-100 lg:flex">
       <aside className="border-b border-zinc-800 bg-[#101014] px-6 py-6 lg:min-h-screen lg:w-64 lg:shrink-0 lg:border-b-0 lg:border-r lg:px-5">
-        <div className="flex items-center gap-3 px-2"><div className="rounded-xl bg-orange-500 p-3 text-zinc-950"><MonitorSmartphone size={23}/></div><div><h1 className="text-lg font-semibold">CoreLink</h1><p className="small muted">Your devices, together</p></div></div>
+        <div className="flex items-center gap-3 px-2"><img src={corelinkLogo} alt="" className="h-12 w-12 rounded-xl border border-zinc-800"/><div><h1 className="text-lg font-semibold">CoreLink</h1><p className="small muted">Your devices, together</p></div></div>
         <nav aria-label="Main navigation" className="mt-8 flex gap-2 lg:flex-col">
           {[['home','Overview',MonitorSmartphone],['mirror','Mirror phone',Smartphone],['settings','Settings',Settings2]].map(([id,label,Icon]) => <button key={id} onClick={()=>setPage(id)} aria-current={page===id?'page':undefined} className={`flex items-center gap-3 rounded-xl px-4 py-3 text-left text-sm font-medium transition ${page===id?'bg-orange-500/15 text-orange-400':'text-zinc-400 hover:bg-zinc-800 hover:text-white'}`}><Icon size={18}/>{label}</button>)}
         </nav>

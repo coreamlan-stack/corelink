@@ -23,7 +23,7 @@ import androidx.compose.ui.unit.dp
 import org.json.JSONObject
 
 private val Panel = Color(0xF0191A1E)
-private val Accent = Color(0xffffa84d)
+private val Accent = Color(0xffff7900)
 
 /** Use the picture as a relative touchpad: drag to move and tap to click. */
 @Composable

@@ -60,7 +60,7 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun CoreLinkApp(vm: CompanionViewModel = viewModel()) {
     val ui by vm.ui.collectAsState()
-    val orange = Color(0xffff8a19)
+    val orange = Color(0xffff7900)
     var scanning by remember { mutableStateOf(false) }
     var scanError by remember { mutableStateOf("") }
     var viewingPc by rememberSaveable { mutableStateOf(false) }
@@ -82,13 +82,13 @@ fun CoreLinkApp(vm: CompanionViewModel = viewModel()) {
         Surface { if (ui.connected) {
             if (viewingPc) RemoteScreen(vm, ui, onDashboard = { viewingPc = false }) else RemoteDashboard(vm, ui, onViewPc = { viewingPc = true })
         } else Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().padding(22.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
-            Text("CoreLink", style = MaterialTheme.typography.headlineMedium)
-            Text("Windows companion", color = Color.LightGray)
+            Text("CORELINK", color = orange, style = MaterialTheme.typography.labelLarge)
+            Text(if (ui.hasSavedPc) "Your PC remote" else "Connect your PC", style = MaterialTheme.typography.headlineMedium)
             if (!ui.connected) {
-                Text("Pair with your PC", style = MaterialTheme.typography.titleMedium)
-                Text("Start CoreLink on Windows and scan its QR code to connect.", style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
-                if (ui.hasSavedPc) Button({ vm.reconnect(context) }, modifier = Modifier.fillMaxWidth(), enabled = !ui.busy && !scanning) { Text(if (ui.busy) "Connecting…" else "Connect saved PC") }
-                Button({
+                Text(if (!ui.hasSavedPc) "Get started" else if (ui.message == "Disconnected") "Disconnected" else "Looking for your PC", style = MaterialTheme.typography.titleMedium)
+                Text(if (ui.hasSavedPc) "Keep CoreLink open on both devices and connect them to the same network or hotspot." else "Open CoreLink on your PC, choose Add phone, and scan its QR code.", style = MaterialTheme.typography.bodyMedium, color = Color.LightGray)
+                if (ui.hasSavedPc) Button({ vm.reconnect(context) }, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp), enabled = !ui.busy && !scanning) { Text(if (ui.busy) "Connecting…" else "Reconnect") }
+                OutlinedButton({
                     scanError = ""
                     scanning = true
                     GmsBarcodeScanning.getClient(context as ComponentActivity).startScan()
@@ -99,7 +99,7 @@ fun CoreLinkApp(vm: CompanionViewModel = viewModel()) {
                         }
                         .addOnFailureListener { scanError = "Could not scan the QR code. Please try again." }
                         .addOnCompleteListener { scanning = false }
-                }, modifier = Modifier.fillMaxWidth(), enabled = !ui.busy && !scanning) { Text(if (ui.busy) "Connecting…" else if (scanning) "Opening scanner…" else "Scan CoreLink QR") }
+                }, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp), enabled = !ui.busy && !scanning) { Text(if (scanning) "Opening scanner…" else if (ui.hasSavedPc) "Connect a different PC" else "Scan QR code") }
                 if (scanError.isNotEmpty()) Text(scanError, color = Color(0xfffca5a5))
             }
             if (ui.message.isNotBlank()) Text(ui.message, color = if (ui.error) Color(0xfffca5a5) else Color.LightGray)

@@ -4,6 +4,8 @@
     <group android:pivotX="54" android:pivotY="54" android:scaleX="0.8" android:scaleY="0.8">
         <path android:fillColor="#FF7900" android:pathData="M24,28h48c4.42,0 8,3.58 8,8v26c0,4.42 -3.58,8 -8,8h-17v5h10a3,3 0,0 1,0 6h-32a3,3 0,0 1,0 -6h10v-5h-19c-4.42,0 -8,-3.58 -8,-8v-26c0,-4.42 3.58,-8 8,-8zM24,34c-1.1,0 -2,0.9 -2,2v26c0,1.1 0.9,2 2,2h48c1.1,0 2,-0.9 2,-2v-26c0,-1.1 -0.9,-2 -2,-2z" />
         <path android:fillColor="#09090B" android:pathData="M65,44h14c4.42,0 8,3.58 8,8v23c0,4.42 -3.58,8 -8,8h-14c-4.42,0 -8,-3.58 -8,-8v-23c0,-4.42 3.58,-8 8,-8z" />
-        <path android:fillColor="#FFFFFF" android:pathData="M65,47h14c2.76,0 5,2.24 5,5v23c0,2.76 -2.24,5 -5,5h-14c-2.76,0 -5,-2.24 -5,-5v-23c0,-2.76 2.24,-5 5,-5zM65,52v23h14v-23z" />
+        <path android:fillColor="#F4F4F5" android:pathData="M65,47h14c2.76,0 5,2.24 5,5v23c0,2.76 -2.24,5 -5,5h-14c-2.76,0 -5,-2.24 -5,-5v-23c0,-2.76 2.24,-5 5,-5z" />
+        <path android:fillColor="#18181B" android:pathData="M66,50h12c1.1,0 2,0.9 2,2v20c0,1.1 -0.9,2 -2,2h-12c-1.1,0 -2,-0.9 -2,-2v-20c0,-1.1 0.9,-2 2,-2z" />
+        <path android:fillColor="#18181B" android:pathData="M72,76m-1,0a1,1 0,1 0,2 0a1,1 0,1 0,-2 0" />
     </group>
 </vector>

@@ -11,6 +11,7 @@ import java.net.InetSocketAddress
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
+import java.net.NetworkInterface
 import android.os.SystemClock
 import java.security.MessageDigest
 import java.security.SecureRandom
@@ -214,7 +215,7 @@ class CoreLinkClient private constructor(private val context: Context, private v
         fun reconnectSaved(context: Context): Result<CoreLinkClient> = runCatching {
             val saved = fromSaved(context) ?: error("No saved PC. Scan a CoreLink QR code first.")
             if (saved.connect().isSuccess) return@runCatching saved
-            val candidates = discoverCandidates()
+            val candidates = discoverCandidates(saved.enrollment.host)
             for (host in candidates) {
                 if (host == saved.enrollment.host) continue
                 val candidate = CoreLinkClient(saved.context, saved.enrollment.copy(host = host)).also { it.secret = saved.secret }
@@ -225,14 +226,25 @@ class CoreLinkClient private constructor(private val context: Context, private v
             }
             error("Could not connect to the saved PC. Start CoreLink on the same Wi-Fi and try again, or scan its QR code.")
         }
-        private fun discoverCandidates(): Set<String> {
+        private fun discoverCandidates(savedHost: String): Set<String> {
             val found = linkedSetOf<String>()
             runCatching {
                 DatagramSocket().use { socket ->
                     socket.broadcast = true
                     socket.soTimeout = 400
                     val request = "CORELINK_DISCOVER_V1".toByteArray(Charsets.US_ASCII)
-                    socket.send(DatagramPacket(request, request.size, InetAddress.getByName("255.255.255.255"), 49877))
+                    val broadcasts = linkedSetOf("255.255.255.255")
+                    savedSubnetBroadcast(savedHost)?.let { broadcasts.add(it) }
+                    runCatching {
+                        NetworkInterface.getNetworkInterfaces()?.toList()?.forEach { network ->
+                            network.interfaceAddresses.forEach { address ->
+                                address.broadcast?.hostAddress?.let { broadcasts.add(it) }
+                            }
+                        }
+                    }
+                    broadcasts.forEach { destination ->
+                        runCatching { socket.send(DatagramPacket(request, request.size, InetAddress.getByName(destination), 49877)) }
+                    }
                     val until = SystemClock.elapsedRealtime() + 1600
                     while (SystemClock.elapsedRealtime() < until && found.size < 8) {
                         val packet = DatagramPacket(ByteArray(128), 128)
@@ -247,6 +259,10 @@ class CoreLinkClient private constructor(private val context: Context, private v
         }
         internal fun discoveryResponseIsValid(host: String, value: String) =
             QrEnrollment.isPrivateIpv4(host) && value == "CORELINK_HERE_V1:49876"
+        internal fun savedSubnetBroadcast(host: String): String? {
+            if (!QrEnrollment.isPrivateIpv4(host)) return null
+            return host.substringBeforeLast('.') + ".255"
+        }
         fun initialize(context: Context) { secureStore(context) }
         private fun secureStore(context: Context) = EncryptedSharedPreferences.create(context, "corelink_credentials", MasterKey.Builder(context).setKeyScheme(MasterKey.KeyScheme.AES256_GCM).build(), EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV, EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM)
         private fun randomId(): String { val b=ByteArray(16);SecureRandom().nextBytes(b);return encode(b) }
