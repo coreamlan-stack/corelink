@@ -64,23 +64,29 @@ fun CoreLinkApp(vm: CompanionViewModel = viewModel()) {
     var scanning by remember { mutableStateOf(false) }
     var scanError by remember { mutableStateOf("") }
     var viewingPc by rememberSaveable { mutableStateOf(false) }
+    var remoteOpen by rememberSaveable { mutableStateOf(false) }
     val activity = LocalContext.current as ComponentActivity
     val context = LocalContext.current
     LaunchedEffect(Unit) { vm.initialize(context) }
-    LaunchedEffect(ui.connected) { if (!ui.connected) viewingPc = false }
-    DisposableEffect(ui.connected, viewingPc) {
-        activity.requestedOrientation = if (ui.connected && viewingPc) ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE else ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+    LaunchedEffect(ui.connected, ui.message) {
+        if (ui.connected) remoteOpen = true
+        if (ui.message == "Disconnected") { viewingPc = false; remoteOpen = false }
+    }
+    DisposableEffect(viewingPc) {
+        activity.requestedOrientation = if (viewingPc) ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE else ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
         val bars = WindowCompat.getInsetsController(activity.window, activity.window.decorView)
-        if (ui.connected && viewingPc) {
+        if (viewingPc) {
             bars.systemBarsBehavior = androidx.core.view.WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
             bars.hide(androidx.core.view.WindowInsetsCompat.Type.systemBars())
         } else bars.show(androidx.core.view.WindowInsetsCompat.Type.systemBars())
         onDispose { bars.show(androidx.core.view.WindowInsetsCompat.Type.systemBars()) }
     }
-    BackHandler(enabled = ui.connected && viewingPc) { viewingPc = false }
+    BackHandler(enabled = viewingPc) { viewingPc = false }
     MaterialTheme(colorScheme = darkColorScheme(primary = orange, background = Color(0xff09090b), surface = Color(0xff18181b))) {
-        Surface { if (ui.connected) {
-            if (viewingPc) RemoteScreen(vm, ui, onDashboard = { viewingPc = false }) else RemoteDashboard(vm, ui, onViewPc = { viewingPc = true })
+        Surface { if (viewingPc) {
+            RemoteScreen(vm, ui, onDashboard = { viewingPc = false })
+        } else if (ui.connected || remoteOpen) {
+            RemoteDashboard(vm, ui, onViewPc = { viewingPc = true })
         } else Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().padding(22.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
             Text("CORELINK", color = orange, style = MaterialTheme.typography.labelLarge)
             Text(if (ui.hasSavedPc) "Your PC remote" else "Connect your PC", style = MaterialTheme.typography.headlineMedium)

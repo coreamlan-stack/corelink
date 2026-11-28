@@ -237,7 +237,7 @@ impl CompanionState {
         Ok(state)
     }
     pub fn start(&self) -> Result<(), String> {
-        let ip = lan_ip()?;
+        let ip = lan_ip().ok();
         // Accept private peers on every adapter so a hotspot still works when
         // Windows prefers Ethernet for its default route. Peer filtering and
         // the authenticated, pinned TLS session remain enforced below.
@@ -250,7 +250,7 @@ impl CompanionState {
                 return Ok(());
             }
             i.running = true;
-            i.endpoint = Some(ip);
+            i.endpoint = ip;
             i.enrollment = Some(Enrollment {
                 token: random(),
                 expires: Instant::now() + ENROLLMENT_TTL,
@@ -273,7 +273,7 @@ impl CompanionState {
         }
         thread::spawn(move || loop {
             match l.accept() {
-                Ok((s, p)) if private_peer(p.ip()) => {
+                Ok((s, p)) if private_peer(p.ip()) || p.ip().is_loopback() => {
                     let x = st.clone();
                     thread::spawn(move || serve(s, x));
                 }
@@ -323,7 +323,9 @@ impl CompanionState {
         }).unwrap_or(false)
     }
     pub fn snapshot(&self) -> CompanionSnapshot {
+        let current_ip = lan_ip().ok();
         let mut i = self.0.lock().expect("state");
+        i.endpoint = current_ip;
         if i.sessions.values().any(|s| s.expires <= Instant::now()) { release_held_buttons(); }
         i.sessions.retain(|_, s| s.expires > Instant::now());
         let (q, svg, e) = match (&i.enrollment, i.endpoint) {

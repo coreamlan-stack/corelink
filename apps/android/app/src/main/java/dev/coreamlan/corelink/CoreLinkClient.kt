@@ -48,6 +48,7 @@ data class QrEnrollment(val host: String, val port: Int, val pin: ByteArray, val
 }
 
 class CoreLinkClient private constructor(private val context: Context, private val enrollment: QrEnrollment) {
+    val connectionLabel: String get() = if (enrollment.host == "127.0.0.1") "USB" else "Local network"
     private val store by lazy { secureStore(context) }
     private val deviceId get() = store.getString("device_id", null) ?: randomId().also { store.edit().putString("device_id", it).apply() }
     private var secret: ByteArray? = store.getString("secret_${enrollment.host}_${enrollment.port}", null)?.let { decode(it) }
@@ -214,6 +215,10 @@ class CoreLinkClient private constructor(private val context: Context, private v
         /** Discovery replies are untrusted hints; TLS pinning happens before any session request. */
         fun reconnectSaved(context: Context): Result<CoreLinkClient> = runCatching {
             val saved = fromSaved(context) ?: error("No saved PC. Scan a CoreLink QR code first.")
+            // This loopback endpoint exists only when the PC has established an
+            // ADB reverse tunnel. Authentication still uses the saved TLS pin.
+            val usb = CoreLinkClient(saved.context, saved.enrollment.copy(host = "127.0.0.1")).also { it.secret = saved.secret }
+            if (usb.connect().isSuccess) return@runCatching usb
             if (saved.connect().isSuccess) return@runCatching saved
             val candidates = discoverCandidates(saved.enrollment.host)
             for (host in candidates) {

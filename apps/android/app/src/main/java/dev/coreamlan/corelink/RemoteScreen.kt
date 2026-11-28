@@ -73,7 +73,8 @@ fun RemoteScreen(vm: CompanionViewModel, ui: CompanionUiState, onDashboard: () -
             FilledTonalButton(onClick = { controls = !controls; if (!controls) { keyboard = false; keyboardController?.hide() } }, contentPadding = PaddingValues(horizontal = 16.dp), modifier = Modifier.height(44.dp), colors = ButtonDefaults.filledTonalButtonColors(containerColor = Panel, contentColor = Color.White)) {
                 Text(if (controls) "Hide controls" else "Controls", style = MaterialTheme.typography.labelLarge)
             }
-            if (ui.error && ui.message.isNotBlank()) Text(ui.message, color = Color(0xffffaaa5), modifier = Modifier.background(Panel, RoundedCornerShape(8.dp)).padding(8.dp))
+            if (!ui.connected) Text("Connection lost · Reconnecting…", color = Color.White, modifier = Modifier.background(Panel, RoundedCornerShape(8.dp)).padding(8.dp))
+            else if (ui.error && ui.message.isNotBlank()) Text(ui.message, color = Color(0xffffaaa5), modifier = Modifier.background(Panel, RoundedCornerShape(8.dp)).padding(8.dp))
         }
         if (controls) Column(Modifier.align(Alignment.BottomCenter).displayCutoutPadding().imePadding().padding(8.dp).fillMaxWidth().background(Panel, RoundedCornerShape(16.dp)).padding(horizontal = 8.dp, vertical = 4.dp)) {
             if (keyboard) {

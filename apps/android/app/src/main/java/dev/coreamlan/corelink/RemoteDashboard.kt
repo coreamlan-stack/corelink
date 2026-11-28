@@ -53,9 +53,10 @@ fun RemoteDashboard(vm: CompanionViewModel, ui: CompanionUiState, onViewPc: () -
         if (keyboardVisible) { focus.requestFocus(); keyboard?.show() }
     }
 
+    BoxWithConstraints(Modifier.fillMaxSize().background(RemoteBackground).statusBarsPadding().navigationBarsPadding().imePadding()) {
+    val padHeight = (maxHeight - 555.dp).coerceIn(170.dp, 420.dp)
     Column(
-        Modifier.fillMaxSize().background(RemoteBackground).statusBarsPadding().navigationBarsPadding()
-            .imePadding().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp, vertical = 18.dp),
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp, vertical = 18.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
@@ -64,10 +65,10 @@ fun RemoteDashboard(vm: CompanionViewModel, ui: CompanionUiState, onViewPc: () -
                 Spacer(Modifier.height(3.dp))
                 Text("PC remote", color = Color.White, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
             }
-            Row(Modifier.background(Color(0xff173126), CircleShape).padding(horizontal = 12.dp, vertical = 7.dp), verticalAlignment = Alignment.CenterVertically) {
-                Box(Modifier.size(7.dp).background(Color(0xff71db9c), CircleShape))
+            Row(Modifier.background(if (ui.connected) Color(0xff173126) else Color(0xff49351c), CircleShape).padding(horizontal = 12.dp, vertical = 7.dp), verticalAlignment = Alignment.CenterVertically) {
+                Box(Modifier.size(7.dp).background(if (ui.connected) Color(0xff71db9c) else Color(0xffffbb66), CircleShape))
                 Spacer(Modifier.width(7.dp))
-                Text("Connected", color = Color(0xffa2e8bc), style = MaterialTheme.typography.labelMedium)
+                Text(if (!ui.connected) "Reconnecting…" else if (ui.connectionLabel.isNotBlank()) "Connected · ${ui.connectionLabel}" else "Connected", color = if (ui.connected) Color(0xffa2e8bc) else Color(0xffffd497), style = MaterialTheme.typography.labelMedium)
             }
         }
 
@@ -79,37 +80,12 @@ fun RemoteDashboard(vm: CompanionViewModel, ui: CompanionUiState, onViewPc: () -
             Text("›", fontSize = 27.sp, lineHeight = 27.sp)
         }
 
-        Column(Modifier.fillMaxWidth().background(RemoteSurface, RoundedCornerShape(22.dp)).border(1.dp, RemoteBorder, RoundedCornerShape(22.dp)).padding(12.dp)) {
-            Row(Modifier.fillMaxWidth().padding(start = 4.dp, end = 2.dp, bottom = 10.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
-                Column {
-                    Text("TOUCHPAD", color = Color(0xffe5e5e8), fontSize = 11.sp, letterSpacing = 1.2.sp, fontWeight = FontWeight.Bold)
-                    Text("Tap to click · Hold for right click", color = RemoteMuted, style = MaterialTheme.typography.labelSmall)
-                }
-                TextButton(onClick = { speed = when (speed) { 2.4f -> 4f; 4f -> 1.2f; else -> 2.4f } }, contentPadding = PaddingValues(horizontal = 9.dp), modifier = Modifier.heightIn(min = 48.dp)) {
-                    Text("${speed}×", color = RemoteOrange, style = MaterialTheme.typography.labelLarge)
-                }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            RemoteKey("keyboard", if (keyboardVisible) "Hide keyboard" else "Keyboard", Modifier.weight(1f)) {
+                keyboardVisible = !keyboardVisible
+                if (!keyboardVisible) keyboard?.hide()
             }
-            Box(Modifier.fillMaxWidth().heightIn(min = 170.dp).height(190.dp)
-                .background(Color(0xff26282d), RoundedCornerShape(15.dp))
-                .border(1.dp, Color(0xff393b42), RoundedCornerShape(15.dp))
-                .semantics { contentDescription = "Touchpad. Drag to move pointer, tap for left click, hold for right click." }
-                .pointerInput(Unit) { detectTapGestures(onTap = { click("left") }, onLongPress = { click("right") }) }
-                .pointerInput(speed) {
-                    var x = 0f; var y = 0f
-                    detectDragGestures(onDragStart = { x = 0f; y = 0f }) { change, delta ->
-                        change.consume(); x += delta.x * speed; y += delta.y * speed
-                        val dx = x.toInt().coerceIn(-5000, 5000); val dy = y.toInt().coerceIn(-5000, 5000)
-                        x -= dx; y -= dy
-                        if (dx != 0 || dy != 0) vm.input(JSONObject().put("kind", "move").put("dx", dx).put("dy", dy))
-                    }
-                }, contentAlignment = Alignment.Center) {
-                Text("·  ·  ·", color = Color(0xff666970), fontSize = 21.sp, letterSpacing = 4.sp)
-            }
-            Spacer(Modifier.height(8.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                RemoteKey("mouse_left", "Left click", Modifier.weight(1f)) { click("left") }
-                RemoteKey("mouse_right", "Right click", Modifier.weight(1f)) { click("right") }
-            }
+            RemoteKey("power", "Disconnect", Modifier.weight(1f)) { vm.disconnect() }
         }
 
         Column(Modifier.fillMaxWidth().background(RemoteSurface, RoundedCornerShape(20.dp)).border(1.dp, RemoteBorder, RoundedCornerShape(20.dp)).padding(horizontal = 14.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -138,19 +114,51 @@ fun RemoteDashboard(vm: CompanionViewModel, ui: CompanionUiState, onViewPc: () -
             }
         }
 
+        Column(Modifier.fillMaxWidth().background(RemoteSurface, RoundedCornerShape(22.dp)).border(1.dp, RemoteBorder, RoundedCornerShape(22.dp)).padding(12.dp)) {
+            Row(Modifier.fillMaxWidth().padding(start = 4.dp, end = 2.dp, bottom = 10.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+                Column {
+                    Text("TOUCHPAD", color = Color(0xffe5e5e8), fontSize = 11.sp, letterSpacing = 1.2.sp, fontWeight = FontWeight.Bold)
+                    Text("Tap to click · Hold for right click", color = RemoteMuted, style = MaterialTheme.typography.labelSmall)
+                }
+                TextButton(onClick = { speed = when (speed) { 2.4f -> 4f; 4f -> 1.2f; else -> 2.4f } }, contentPadding = PaddingValues(horizontal = 9.dp), modifier = Modifier.heightIn(min = 48.dp)) {
+                    Text("${speed}×", color = RemoteOrange, style = MaterialTheme.typography.labelLarge)
+                }
+            }
+            Box(Modifier.fillMaxWidth().height(padHeight)
+                .background(Color(0xff26282d), RoundedCornerShape(15.dp))
+                .border(1.dp, Color(0xff393b42), RoundedCornerShape(15.dp))
+                .semantics { contentDescription = "Touchpad. Drag to move pointer, tap for left click, hold for right click." }
+                .pointerInput(Unit) { detectTapGestures(onTap = { click("left") }, onLongPress = { click("right") }) }
+                .pointerInput(speed) {
+                    var x = 0f; var y = 0f
+                    detectDragGestures(onDragStart = { x = 0f; y = 0f }) { change, delta ->
+                        change.consume(); x += delta.x * speed; y += delta.y * speed
+                        val dx = x.toInt().coerceIn(-5000, 5000); val dy = y.toInt().coerceIn(-5000, 5000)
+                        x -= dx; y -= dy
+                        if (dx != 0 || dy != 0) vm.input(JSONObject().put("kind", "move").put("dx", dx).put("dy", dy))
+                    }
+                })
+            Spacer(Modifier.height(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                ClickKey("Left click", Modifier.weight(1f)) { click("left") }
+                ClickKey("Right click", Modifier.weight(1f)) { click("right") }
+            }
+        }
+
         if (keyboardVisible) {
             OutlinedTextField(value = typed, onValueChange = { value ->
                 if (value.isNotEmpty()) { vm.input(JSONObject().put("kind", "text").put("text", value)); typed = "" }
             }, label = { Text("Type on PC") }, modifier = Modifier.fillMaxWidth().focusRequester(focus), singleLine = true, shape = RoundedCornerShape(14.dp))
         }
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            RemoteKey("keyboard", if (keyboardVisible) "Hide keyboard" else "Keyboard", Modifier.weight(1f)) {
-                keyboardVisible = !keyboardVisible
-                if (!keyboardVisible) keyboard?.hide()
-            }
-            RemoteKey("power", "Disconnect", Modifier.weight(1f)) { vm.disconnect() }
-        }
         if (ui.error && ui.message.isNotBlank()) Text(ui.message, color = Color(0xffffaaa5), style = MaterialTheme.typography.bodySmall)
+    }
+    }
+}
+
+@Composable
+private fun ClickKey(label: String, modifier: Modifier = Modifier, action: () -> Unit) {
+    OutlinedButton(onClick = action, modifier = modifier.heightIn(min = 48.dp), shape = RoundedCornerShape(12.dp), border = androidx.compose.foundation.BorderStroke(1.dp, RemoteBorder), colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xffe7e7e9), containerColor = Color(0xff202126))) {
+        Text(label, style = MaterialTheme.typography.labelLarge)
     }
 }
 
@@ -190,8 +198,8 @@ internal fun RemoteIcon(name: String, tint: Color) {
                 }
                 "mouse_left", "mouse_right" -> {
                     drawRoundRect(tint, Offset(6f, 2f), Size(12f, 20f), CornerRadius(6f), style = Stroke(line))
+                    drawRoundRect(RemoteOrange, Offset(if (name == "mouse_left") 7.2f else 12.5f, 3.7f), Size(4.3f, 5.5f), CornerRadius(1.5f))
                     segment(6f, 10f, 18f, 10f); segment(12f, 2f, 12f, 10f)
-                    drawCircle(RemoteOrange, 1.7f, Offset(if (name == "mouse_left") 9f else 15f, 6.5f))
                 }
                 "minus", "plus" -> {
                     segment(5f, 12f, 19f, 12f)

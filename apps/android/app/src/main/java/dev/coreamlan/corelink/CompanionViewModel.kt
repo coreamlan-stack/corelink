@@ -14,7 +14,7 @@ import kotlinx.coroutines.channels.Channel
 import org.json.JSONObject
 import javax.net.ssl.SSLSocket
 
-data class CompanionUiState(val connected: Boolean = false, val busy: Boolean = false, val message: String = "", val error: Boolean = false, val hasSavedPc: Boolean = false)
+data class CompanionUiState(val connected: Boolean = false, val busy: Boolean = false, val message: String = "", val error: Boolean = false, val hasSavedPc: Boolean = false, val connectionLabel: String = "")
 
 class CompanionViewModel : ViewModel() {
     private val _ui = MutableStateFlow(CompanionUiState())
@@ -62,7 +62,7 @@ class CompanionViewModel : ViewModel() {
                     onFailure = { Result.failure(it) }
                 )
             }
-            result.onSuccess { candidate -> client = candidate; _ui.value = CompanionUiState(connected = true, message = "Connected", hasSavedPc = true) }
+            result.onSuccess { candidate -> client = candidate; _ui.value = CompanionUiState(connected = true, message = "Connected", hasSavedPc = true, connectionLabel = candidate.connectionLabel) }
                 .onFailure { problem -> _ui.value = _ui.value.copy(busy = false, message = problem.message ?: "Pairing failed", error = true) }
         }
     }
@@ -104,7 +104,7 @@ class CompanionViewModel : ViewModel() {
             result.onSuccess { candidate ->
                 if (foreground && autoReconnect) {
                     client = candidate
-                    _ui.value = CompanionUiState(connected = true, message = "Connected", hasSavedPc = true)
+                    _ui.value = CompanionUiState(connected = true, message = "Connected", hasSavedPc = true, connectionLabel = candidate.connectionLabel)
                 } else {
                     viewModelScope.launch(Dispatchers.IO) { candidate.disconnect() }
                     _ui.value = _ui.value.copy(busy = false, message = "")

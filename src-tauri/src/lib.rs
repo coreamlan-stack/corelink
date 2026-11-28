@@ -1,5 +1,6 @@
 use serde::Serialize;
 use std::{io::Read, time::Duration};
+use std::collections::HashSet;
 use std::{
     net::Ipv4Addr,
     process::{Child, Command, Stdio},
@@ -15,6 +16,8 @@ use companion::{CompanionSnapshot, CompanionState};
 
 #[derive(Default)]
 struct MirrorState(Mutex<Option<Child>>);
+#[derive(Default)]
+struct UsbBridgeState(Mutex<HashSet<String>>);
 
 impl Drop for MirrorState {
     fn drop(&mut self) {
@@ -186,7 +189,7 @@ fn local_endpoint(value: &str) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn get_snapshot(state: State<'_, MirrorState>) -> Result<Snapshot, String> {
+fn get_snapshot(state: State<'_, MirrorState>, usb: State<'_, UsbBridgeState>) -> Result<Snapshot, String> {
     let adb = tool_location("adb");
     let scrcpy = tool_location("scrcpy");
     let devices = if adb.found {
@@ -194,6 +197,16 @@ fn get_snapshot(state: State<'_, MirrorState>) -> Result<Snapshot, String> {
     } else {
         Vec::new()
     };
+    // Set up a local ADB reverse tunnel only for USB-debugging devices. Never
+    // replace an existing mapping that another tool or user created.
+    if let Ok(mut bridged) = usb.0.lock() {
+        bridged.retain(|serial| devices.iter().any(|d| d.state == "device" && &d.serial == serial));
+        for device in devices.iter().filter(|d| d.state == "device" && !d.serial.contains(':')) {
+            if !bridged.contains(&device.serial) && adb_output(&["-s", &device.serial, "reverse", "--no-rebind", "tcp:49876", "tcp:49876"]).is_ok() {
+                bridged.insert(device.serial.clone());
+            }
+        }
+    }
     let mut child = state.0.lock().map_err(|_| "Mirroring state lock failed")?;
     let mirroring = if let Some(p) = child.as_mut() {
         match p.try_wait() {
@@ -367,6 +380,7 @@ fn stop_capture(state: State<'_, Arc<capture::CaptureState>>) { state.stop(); }
 pub fn run() {
     tauri::Builder::default()
         .manage(MirrorState::default())
+        .manage(UsbBridgeState::default())
         .setup(|app| {
             let capture = Arc::new(capture::CaptureState::default());
             let path = app.path().app_data_dir()?.join("companion.dat");
