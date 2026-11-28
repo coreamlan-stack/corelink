@@ -238,8 +238,11 @@ impl CompanionState {
     }
     pub fn start(&self) -> Result<(), String> {
         let ip = lan_ip()?;
-        let l = TcpListener::bind((ip, COMPANION_PORT))
-            .map_err(|e| format!("Could not bind CoreLink to {ip}: {e}"))?;
+        // Accept private peers on every adapter so a hotspot still works when
+        // Windows prefers Ethernet for its default route. Peer filtering and
+        // the authenticated, pinned TLS session remain enforced below.
+        let l = TcpListener::bind((Ipv4Addr::UNSPECIFIED, COMPANION_PORT))
+            .map_err(|e| format!("Could not start the CoreLink listener: {e}"))?;
         l.set_nonblocking(true).map_err(|e| e.to_string())?;
         {
             let mut i = self.0.lock().map_err(|_| "state lock")?;
