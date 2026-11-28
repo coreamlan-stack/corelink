@@ -12,10 +12,12 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.rememberCoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.DataInputStream
+import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import javax.net.ssl.SSLSocket
@@ -29,6 +31,7 @@ fun DesktopAudio(open: () -> Result<SSLSocket>) {
         val closed = AtomicBoolean(false)
         val socket = AtomicReference<SSLSocket?>(null)
         val job = scope.launch(Dispatchers.IO) {
+          while (!closed.get()) {
             var track: AudioTrack? = null
             try {
                 val connection = open().getOrThrow()
@@ -41,9 +44,11 @@ fun DesktopAudio(open: () -> Result<SSLSocket>) {
                 check(headerBytes.size < 4096) { "Invalid audio response" }
                 val header = JSONObject(headerBytes.toByteArray().toString(Charsets.UTF_8))
                 check(header.optString("type") == "audio_started") { "Start screen sharing to hear PC audio" }
+                withContext(Dispatchers.Main) { warning = "" }
                 val sampleRate = header.getInt("sample_rate"); val channels = header.getInt("channels")
                 check(sampleRate in 8000..192000 && channels in 1..2) { "Unsupported PC audio format" }
                 val format = when (header.getString("format")) { "float32" -> AudioFormat.ENCODING_PCM_FLOAT; "pcm16" -> AudioFormat.ENCODING_PCM_16BIT; else -> error("Unsupported PC audio format") }
+                val frameBytes = channels * if (format == AudioFormat.ENCODING_PCM_FLOAT) 4 else 2
                 val channelMask = if (channels == 1) AudioFormat.CHANNEL_OUT_MONO else AudioFormat.CHANNEL_OUT_STEREO
                 val minBytes = AudioTrack.getMinBufferSize(sampleRate, channelMask, format)
                 check(minBytes > 0) { "Phone cannot play this audio format" }
@@ -59,10 +64,8 @@ fun DesktopAudio(open: () -> Result<SSLSocket>) {
                     check(size in 0..1024 * 1024) { "Invalid audio packet" }
                     if (size == 0) continue
                     val bytes = ByteArray(size); input.readFully(bytes)
-                    var offset = 0
-                    while (offset < bytes.size && !closed.get()) {
-                        val written = audioTrack.write(bytes, offset, bytes.size - offset, AudioTrack.WRITE_BLOCKING)
-                        check(written > 0) { "Audio playback stopped" }; offset += written
+                    writeAudioPacket(bytes, frameBytes, { closed.get() }) { buffer ->
+                        audioTrack.write(buffer, buffer.remaining(), AudioTrack.WRITE_BLOCKING)
                     }
                 }
             } catch (e: Exception) {
@@ -71,8 +74,23 @@ fun DesktopAudio(open: () -> Result<SSLSocket>) {
                 runCatching { track?.stop() }; runCatching { track?.release() }
                 runCatching { socket.getAndSet(null)?.close() }
             }
+            if (!closed.get()) delay(2_000)
+          }
         }
         onDispose { closed.set(true); runCatching { socket.getAndSet(null)?.close() }; job.cancel() }
     }
     if (warning.isNotEmpty()) Text(warning)
+}
+
+/** ByteBuffer writes support both float32 and PCM16; the byte-array AudioTrack
+ * overload does not support float32 on Android. Packets are whole PCM frames. */
+internal fun writeAudioPacket(bytes: ByteArray, frameBytes: Int, stopped: () -> Boolean, write: (ByteBuffer) -> Int) {
+    require(frameBytes > 0 && bytes.size % frameBytes == 0) { "Invalid audio packet alignment" }
+    val buffer = ByteBuffer.allocateDirect(bytes.size).put(bytes).apply { flip() }
+    while (buffer.hasRemaining() && !stopped()) {
+        val before = buffer.position()
+        val written = write(buffer)
+        check(written > 0) { "Audio playback failed (code $written)" }
+        check(written % frameBytes == 0 && buffer.position() - before == written) { "Invalid audio write" }
+    }
 }

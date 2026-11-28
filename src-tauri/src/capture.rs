@@ -87,6 +87,7 @@ pub struct CaptureSnapshot {
     pub starting: bool,
     pub source: String,
     pub frames: u64,
+    pub encoding_fps: u32,
     pub error: String,
 }
 #[derive(Default)]
@@ -127,6 +128,7 @@ impl CaptureState {
             let mut state = snapshot.lock().unwrap();
             state.running = false;
             state.starting = false;
+            state.encoding_fps = 0;
             if let Err(e) = result {
                 state.error = e;
             }
@@ -242,6 +244,8 @@ fn capture(
         let started_at = std::time::Instant::now();
         let mut received_frame = false;
         let mut last_video = std::time::Instant::now() - Duration::from_secs(1);
+        let mut fps_since = std::time::Instant::now();
+        let mut encoded_frames = 0u32;
         let mut encoder = FrameEncoder::default();
         while !stop.load(Ordering::SeqCst) {
             let now = unsafe { GetTickCount64() };
@@ -257,10 +261,11 @@ fn capture(
                 let frame = pool.TryGetNextFrame()?;
                 received_frame = true;
                 let next = frame.ContentSize()?;
-                if last_video.elapsed() >= Duration::from_millis(100)
+                if last_video.elapsed() >= Duration::from_millis(16)
                     && next.Width == size.Width
                     && next.Height == size.Height
                 {
+                    last_video = std::time::Instant::now();
                     let video = encoder.encode_frame(
                         &frame,
                         &d3d,
@@ -268,6 +273,13 @@ fn capture(
                         state.lock().unwrap().frames + 1,
                         &stop,
                     )?;
+                    encoded_frames += 1;
+                    let elapsed = fps_since.elapsed();
+                    if elapsed >= Duration::from_secs(1) {
+                        state.lock().unwrap().encoding_fps = (encoded_frames as f64 / elapsed.as_secs_f64()).round() as u32;
+                        encoded_frames = 0;
+                        fps_since = std::time::Instant::now();
+                    }
                     if !stop.load(Ordering::SeqCst) {
                         if let Ok(mut slot) = VIDEO.get_or_init(|| Mutex::new(None)).lock() {
                             if !stop.load(Ordering::SeqCst) {
@@ -275,7 +287,6 @@ fn capture(
                             }
                         }
                     }
-                    last_video = std::time::Instant::now();
                 }
                 frame.Close()?;
                 state.lock().unwrap().frames += 1;
@@ -306,19 +317,19 @@ struct FrameEncoder {
 }
 
 fn scaled_size(width: u32, height: u32) -> (u32, u32) {
-    let numerator = 960_u64 * u64::from(height);
-    let denominator = 540_u64 * u64::from(width);
-    if width <= 960 && height <= 540 {
+    let numerator = 1920_u64 * u64::from(height);
+    let denominator = 1080_u64 * u64::from(width);
+    if width <= 1920 && height <= 1080 {
         (width, height)
     } else if numerator <= denominator {
         (
-            960,
-            ((u64::from(height) * 960) / u64::from(width)).max(1) as u32,
+            1920,
+            ((u64::from(height) * 1920) / u64::from(width)).max(1) as u32,
         )
     } else {
         (
-            ((u64::from(width) * 540) / u64::from(height)).max(1) as u32,
-            540,
+            ((u64::from(width) * 1080) / u64::from(height)).max(1) as u32,
+            1080,
         )
     }
 }
@@ -403,9 +414,10 @@ mod tests {
     use super::scaled_size;
     #[test]
     fn scales_to_fit_without_upscaling_or_distorting_the_source() {
-        assert_eq!(scaled_size(1920, 1080), (960, 540));
-        assert_eq!(scaled_size(1280, 720), (960, 540));
-        assert_eq!(scaled_size(1080, 1920), (303, 540));
+        assert_eq!(scaled_size(3840, 2160), (1920, 1080));
+        assert_eq!(scaled_size(1920, 1080), (1920, 1080));
+        assert_eq!(scaled_size(1280, 720), (1280, 720));
+        assert_eq!(scaled_size(1080, 1920), (607, 1080));
         assert_eq!(scaled_size(640, 480), (640, 480));
     }
 }

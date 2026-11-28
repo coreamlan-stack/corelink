@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     io::{BufRead, BufReader, Read, Write},
-    net::{IpAddr, Ipv4Addr, TcpListener, TcpStream},
+    net::{IpAddr, Ipv4Addr, TcpListener, TcpStream, UdpSocket},
     sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -60,10 +60,7 @@ struct Pending {
     secret: [u8; 32],
     created: Instant,
 }
-struct Device {
-    name: String,
-    secret: [u8; 32],
-}
+type Device = crate::trusted_store::StoredDevice;
 struct Session {
     device_id: String,
     key: [u8; 32],
@@ -84,6 +81,8 @@ struct Inner {
     used_open_nonces: HashSet<String>,
     endpoint: Option<Ipv4Addr>,
     identity: Identity,
+    storage: Option<std::path::PathBuf>,
+    capture: Option<Arc<crate::capture::CaptureState>>,
 }
 #[derive(Clone)]
 pub struct CompanionState(Arc<Mutex<Inner>>);
@@ -135,6 +134,15 @@ fn config(i: &Identity) -> Result<Arc<ServerConfig>, String> {
         .with_single_cert(vec![i.cert.clone()], i.key.clone_key())
         .map(Arc::new)
         .map_err(|e| e.to_string())
+}
+fn save_trust(inner: &Inner, devices: &HashMap<String, Device>) -> Result<(), String> {
+    if let Some(path)=&inner.storage {
+        crate::trusted_store::save(path, &crate::trusted_store::StoredTrust {
+            version:1, certificate:inner.identity.cert.as_ref().to_vec(),
+            private_key:inner.identity.key.secret_der().to_vec(), devices:devices.clone(),
+        })?;
+    }
+    Ok(())
 }
 fn send<S: Serialize, W: Write>(w: &mut W, v: &S) -> std::io::Result<()> {
     let mut b = serde_json::to_vec(v)?;
@@ -205,10 +213,29 @@ impl Default for CompanionState {
             used_open_nonces: HashSet::new(),
             endpoint: None,
             identity: identity(),
+            storage: None,
+            capture: None,
         })))
     }
 }
 impl CompanionState {
+    pub fn persistent(path: std::path::PathBuf, capture: Arc<crate::capture::CaptureState>) -> Result<Self, String> {
+        let saved = crate::trusted_store::load(&path)?;
+        let state = Self::default();
+        {
+            let mut inner=state.0.lock().map_err(|_| "state lock")?;
+            if let Some(saved)=saved {
+                let cert=CertificateDer::from(saved.certificate);
+                inner.identity=Identity { pin:b64(Sha256::digest(cert.as_ref())), cert, key:PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(saved.private_key)) };
+                config(&inner.identity)?;
+                inner.trusted=saved.devices;
+            }
+            inner.storage=Some(path);
+            inner.capture=Some(capture);
+            save_trust(&inner, &inner.trusted)?;
+        }
+        Ok(state)
+    }
     pub fn start(&self) -> Result<(), String> {
         let ip = lan_ip()?;
         let l = TcpListener::bind((ip, COMPANION_PORT))
@@ -229,6 +256,18 @@ impl CompanionState {
             });
         }
         let st = self.clone();
+        match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 49877)) {
+            Ok(socket) => { let discovery_state=self.clone(); thread::spawn(move || {
+                let _=socket.set_read_timeout(Some(Duration::from_millis(500)));
+                let mut packet=[0u8;64];
+                while discovery_state.running() {
+                    if let Ok((n,peer))=socket.recv_from(&mut packet) {
+                        if private_peer(peer.ip()) && &packet[..n]==b"CORELINK_DISCOVER_V1" { let _=socket.send_to(b"CORELINK_HERE_V1:49876",peer); }
+                    }
+                }
+            }); },
+            Err(error) => eprintln!("CoreLink LAN discovery unavailable: {error}"),
+        }
         thread::spawn(move || loop {
             match l.accept() {
                 Ok((s, p)) if private_peer(p.ip()) => {
@@ -320,13 +359,15 @@ impl CompanionState {
         if i.sessions.values().any(|session| session.device_id == p.request.device_id) { release_held_buttons(); }
         i.sessions
             .retain(|_, session| session.device_id != p.request.device_id);
-        i.trusted.insert(
+        let mut updated=i.trusted.clone();
+        updated.insert(
             p.request.device_id,
             Device {
                 name: p.request.name,
                 secret: p.secret,
             },
         );
+        save_trust(&i,&updated)?; i.trusted=updated;
         Ok(())
     }
     pub fn reject(&self, id: &str) -> Result<(), String> {
@@ -340,8 +381,9 @@ impl CompanionState {
     }
     pub fn revoke(&self, id: &str) -> Result<(), String> {
         let mut i = self.0.lock().map_err(|_| "state lock")?;
+        let mut updated=i.trusted.clone(); updated.remove(id); save_trust(&i,&updated)?;
         if i.sessions.values().any(|s| s.device_id == id) { release_held_buttons(); }
-        i.trusted.remove(id);
+        i.trusted=updated;
         i.sessions.retain(|_, s| s.device_id != id);
         crate::capture::stop_active_capture();
         Ok(())
@@ -366,6 +408,9 @@ enum Request {
         payload: String,
         mac: String,
     },
+    Move { session_id: String, sequence: u64, payload: String, mac: String },
+    Ping { session_id: String, sequence: u64, mac: String },
+    ControlOpen { session_id: String, nonce: String, mac: String },
     Disconnect {
         session_id: String,
         sequence: u64,
@@ -376,11 +421,7 @@ enum Request {
         nonce: String,
         mac: String,
     },
-    AudioOpen {
-        session_id: String,
-        nonce: String,
-        mac: String,
-    },
+    AudioOpen,
 }
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -416,6 +457,7 @@ fn serve(socket: TcpStream, state: CompanionState) {
         eprintln!("CoreLink companion socket setup failed: {error}");
         return;
     }
+    let _ = socket.set_nodelay(true);
     let c = {
         let i = match state.0.lock() {
             Ok(v) => v,
@@ -456,6 +498,12 @@ fn serve(socket: TcpStream, state: CompanionState) {
             payload,
             mac,
         }) => input(&mut tls, state, session_id, sequence, payload, mac),
+        Ok(Request::Move { .. }) => {},
+        Ok(Request::Ping { .. }) => {},
+        Ok(Request::ControlOpen { session_id, nonce, mac }) => {
+            let _ = tls.sock.set_read_timeout(Some(SESSION_TTL));
+            control(&mut tls, state, session_id, nonce, mac)
+        },
         Ok(Request::Disconnect {
             session_id,
             sequence,
@@ -466,7 +514,7 @@ fn serve(socket: TcpStream, state: CompanionState) {
             nonce,
             mac,
         }) => video(&mut tls, state, session_id, nonce, mac),
-        Ok(Request::AudioOpen { session_id, nonce, mac }) => audio(&mut tls, state, session_id, nonce, mac),
+        Ok(Request::AudioOpen) => { let _ = send(&mut tls, &serde_json::json!({"type":"audio_disabled"})); },
         Err(error) => { eprintln!("CoreLink companion request error: {error}"); }
     }
 }
@@ -481,66 +529,33 @@ fn enroll<W: Write>(o: &mut W, s: CompanionState, t: String, id: String, name: S
         let _ = send(o, &serde_json::json!({"type":"rejected"}));
         return;
     };
-    let rid = b64(random::<16>());
     let secret = random();
     let ok = {
         let mut i = match s.0.lock() {
             Ok(v) => v,
             Err(_) => return,
         };
-        match i.enrollment.as_mut() {
+        if !i.running { false } else { match i.enrollment.as_mut() {
             Some(e) if !e.used && e.expires > Instant::now() && t.as_slice() == e.token => {
                 e.used = true;
-                i.pending.insert(
-                    rid.clone(),
-                    Pending {
-                        request: PairRequest {
-                            request_id: rid.clone(),
-                            name,
-                            device_id: id.clone(),
-                        },
-                        secret,
-                        created: Instant::now(),
+                let mut updated=i.trusted.clone(); updated.insert(id.clone(), Device { name, secret });
+                match save_trust(&i,&updated) {
+                    Ok(()) => {
+                        if i.sessions.values().any(|session| session.device_id == id) { release_held_buttons(); }
+                        i.sessions.retain(|_, session| session.device_id != id);
+                        i.trusted=updated; true
                     },
-                );
-                true
+                    Err(error) => { eprintln!("CoreLink could not save pairing: {error}"); false }
+                }
             }
             _ => false,
-        }
+        }}
     };
     if !ok {
         let _ = send(o, &serde_json::json!({"type":"rejected"}));
         return;
     }
-    let _ = send(
-        o,
-        &serde_json::json!({"type":"approval_required","request_id":rid}),
-    );
-    for _ in 0..120 {
-        thread::sleep(Duration::from_millis(500));
-        let (approved, pending) = match s.0.lock() {
-            Ok(i) => (
-                i.trusted.get(&id).is_some_and(|d| d.secret == secret),
-                i.running && i.pending.contains_key(&rid),
-            ),
-            Err(_) => return,
-        };
-        if approved {
-            let _ = send(
-                o,
-                &serde_json::json!({"type":"paired","secret":b64(secret),"session_ttl":SESSION_TTL.as_secs()}),
-            );
-            return;
-        }
-        if !pending {
-            let _ = send(o, &serde_json::json!({"type":"rejected"}));
-            return;
-        }
-    }
-    if let Ok(mut i) = s.0.lock() {
-        i.pending.remove(&rid);
-    }
-    let _ = send(o, &serde_json::json!({"type":"rejected"}));
+    let _ = send(o, &serde_json::json!({"type":"paired","secret":b64(secret),"session_ttl":SESSION_TTL.as_secs()}));
 }
 fn open<W: Write>(o: &mut W, s: CompanionState, did: String, cn: String, tag: String) {
     if URL_SAFE_NO_PAD
@@ -596,34 +611,73 @@ fn open<W: Write>(o: &mut W, s: CompanionState, did: String, cn: String, tag: St
         }
     }
 }
+fn control<T: Read + Write>(stream: &mut T, state: CompanionState, id: String, nonce: String, tag: String) {
+    if URL_SAFE_NO_PAD.decode(&nonce).ok().filter(|v| v.len() == 32).is_none() { return; }
+    let accepted = if let Ok(mut inner) = state.0.lock() {
+        let ok = inner.running && !inner.used_open_nonces.contains(&nonce) && inner.sessions.get(&id).is_some_and(|session|
+            session.expires > Instant::now() && check(&session.key, &transcript(&["control-open", &id, &nonce]), &tag));
+        if ok { inner.used_open_nonces.insert(nonce); }
+        ok
+    } else { false };
+    if !accepted { let _ = send(stream, &serde_json::json!({"type":"control_rejected"})); return; }
+    if send(stream, &serde_json::json!({"type":"control_ready"})).is_err() { return; }
+    let mut reader = BufReader::new(stream);
+    loop {
+        let request = read::<Request, _>(&mut reader);
+        match request {
+            Ok(Request::Input { session_id, sequence, payload, mac }) if session_id == id => {
+                if !state.0.lock().ok().is_some_and(|inner| inner.running && inner.sessions.get(&id).is_some_and(|s| s.expires > Instant::now())) { break; }
+                input(reader.get_mut(), state.clone(), session_id, sequence, payload, mac);
+            }
+            Ok(Request::Move { session_id, sequence, payload, mac }) if session_id == id => {
+                if !matches!(serde_json::from_str::<Input>(&payload), Ok(Input::Move { .. })) || !apply_input(&state, &session_id, sequence, &payload, &mac) { break; }
+            }
+            Ok(Request::Ping { session_id, sequence, mac }) if session_id == id => {
+                let ok=state.0.lock().ok().is_some_and(|mut inner| {
+                    if !inner.running { return false; }
+                    let Some(session)=inner.sessions.get_mut(&id) else { return false; };
+                    if session.expires<=Instant::now() || sequence<=session.last_sequence || !check(&session.key,&transcript(&["ping",&id,&sequence.to_string()]),&mac) { return false; }
+                    session.last_sequence=sequence;session.expires=Instant::now()+SESSION_TTL;true
+                });
+                if send(reader.get_mut(),&serde_json::json!({"type":"pong","ok":ok})).is_err() || !ok { break; }
+            }
+            _ => break,
+        }
+    }
+    if let Ok(_guard) = state.0.lock() { release_held_buttons(); }
+}
 fn input<W: Write>(o: &mut W, s: CompanionState, id: String, seq: u64, p: String, tag: String) {
-    let ok = {
+    let ok = apply_input(&s, &id, seq, &p, &tag);
+    let _ = send(o, &serde_json::json!({"type":"ack","ok":ok}));
+}
+fn apply_input(s: &CompanionState, id: &str, seq: u64, p: &str, tag: &str) -> bool {
+    {
         let mut i = match s.0.lock() {
             Ok(v) => v,
-            Err(_) => return,
+            Err(_) => return false,
         };
         let now = Instant::now();
-        let Some(x) = i.sessions.get_mut(&id) else {
-            return;
+        if !i.running { return false; }
+        let Some(x) = i.sessions.get_mut(id) else {
+            return false;
         };
         if x.expires <= now
             || seq <= x.last_sequence
             || !check(
                 &x.key,
-                &transcript(&["input", &id, &seq.to_string(), &p]),
-                &tag,
+                &transcript(&["input", id, &seq.to_string(), p]),
+                tag,
             )
         {
             false
-        } else if serde_json::from_str::<Input>(&p).is_ok_and(|input| dispatch(input).is_ok()) {
+        } else if serde_json::from_str::<Input>(p).is_ok_and(|input| dispatch(input).is_ok()) {
             x.last_sequence = seq;
             x.expires = now + SESSION_TTL;
             true
         } else {
             false
         }
-    };
-    let _ = send(o, &serde_json::json!({"type":"ack","ok":ok}));
+    }
 }
 fn disconnect<W: Write>(o: &mut W, s: CompanionState, id: String, seq: u64, tag: String) {
     let ok = {
@@ -649,20 +703,6 @@ fn disconnect<W: Write>(o: &mut W, s: CompanionState, id: String, seq: u64, tag:
         crate::capture::stop_active_capture();
     }
     let _ = send(o, &serde_json::json!({"type":"disconnected","ok":ok}));
-}
-fn audio<W: Write>(out: &mut W, state: CompanionState, id: String, nonce: String, tag: String) {
-    if URL_SAFE_NO_PAD.decode(&nonce).ok().filter(|v| v.len() == 32).is_none() { return; }
-    let authorized = if let Ok(mut i) = state.0.lock() {
-        let valid = i.running && !i.used_open_nonces.contains(&nonce) && i.sessions.get(&id).is_some_and(|s| s.expires > Instant::now() && check(&s.key, &transcript(&["audio-open", &id, &nonce]), &tag));
-        if valid { i.used_open_nonces.insert(nonce); }
-        valid
-    } else { false };
-    if !authorized { let _ = send(out, &serde_json::json!({"type":"audio_rejected"})); return; }
-    let Some(first) = crate::capture::latest_frame() else { let _ = send(out, &serde_json::json!({"type":"audio_unavailable"})); return; };
-    if let Err(error) = crate::audio::stream(out, || {
-        let active = state.0.lock().ok().is_some_and(|i| i.running && i.sessions.get(&id).is_some_and(|s| s.expires > Instant::now()));
-        active && crate::capture::latest_frame().is_some_and(|frame| first.same_capture(&frame))
-    }) { eprintln!("CoreLink audio stream ended: {error}"); }
 }
 fn video<W: Write>(o: &mut W, s: CompanionState, id: String, nonce: String, tag: String) {
     if URL_SAFE_NO_PAD
@@ -692,6 +732,25 @@ fn video<W: Write>(o: &mut W, s: CompanionState, id: String, nonce: String, tag:
     if !authorized {
         let _ = send(o, &serde_json::json!({"type":"video_rejected"}));
         return;
+    }
+    let capture = s.0.lock().ok().and_then(|i| i.capture.clone());
+    if let Some(capture) = capture {
+        capture.clear_finished();
+        let snapshot = capture.snapshot();
+        if !snapshot.running && !snapshot.starting {
+            if let Err(error) = capture.start(0) {
+                let current=capture.snapshot();
+                if !current.running && !current.starting { let _=send(o,&serde_json::json!({"type":"video_unavailable","message":error})); return; }
+            }
+        }
+        let deadline=Instant::now()+Duration::from_secs(12);
+        while crate::capture::latest_frame().is_none() && Instant::now()<deadline {
+            let active=s.0.lock().ok().is_some_and(|i|i.running && i.sessions.get(&id).is_some_and(|x|x.expires>Instant::now()));
+            if !active { crate::capture::stop_active_capture(); return; }
+            let snapshot=capture.snapshot();
+            if !snapshot.running && !snapshot.starting { break; }
+            thread::sleep(Duration::from_millis(50));
+        }
     }
     let first = match crate::capture::latest_frame() {
         Some(f) if f.data.len() <= 8 * 1024 * 1024 => f,
@@ -742,7 +801,7 @@ fn video<W: Write>(o: &mut W, s: CompanionState, id: String, nonce: String, tag:
             last_number = Some(frame.number);
             last_sent = Instant::now();
         }
-        thread::sleep(Duration::from_millis(33));
+        thread::sleep(Duration::from_millis(5));
     }
 }
 fn virtual_key(key: &str) -> Option<u8> {
@@ -750,7 +809,8 @@ fn virtual_key(key: &str) -> Option<u8> {
         "tab" | "\t" => Some(0x09), "enter" | "\r" | "\n" => Some(0x0d),
         "backspace" | "\u{8}" => Some(0x08), "escape" | "esc" => Some(0x1b),
         "left" => Some(0x25), "up" => Some(0x26), "right" => Some(0x27), "down" => Some(0x28),
-        "delete" => Some(0x2e),
+        "delete" => Some(0x2e), "volume_up" => Some(0xaf), "volume_down" => Some(0xae),
+        "media_play_pause" => Some(0xb3), "media_next" => Some(0xb0), "media_previous" => Some(0xb1), "volume_mute" => Some(0xad),
         _ if key.len() == 1 && key.as_bytes()[0].is_ascii_alphanumeric() => Some(key.as_bytes()[0].to_ascii_uppercase()),
         _ => None,
     }
@@ -879,6 +939,68 @@ fn send_input(_: Input) -> Result<(), String> {
 mod tests {
     use super::*;
     #[test]
+    fn encrypted_trust_survives_restart_and_revocation() {
+        let path=std::env::temp_dir().join(format!("corelink-trust-test-{}.dat",b64(random::<16>())));
+        let first=CompanionState::persistent(path.clone(),Arc::new(crate::capture::CaptureState::default())).unwrap();
+        let token=[41u8;32];
+        let pin={let mut i=first.0.lock().unwrap();i.running=true;i.enrollment=Some(Enrollment{token,expires:Instant::now()+ENROLLMENT_TTL,expires_at:unix()+120,used:false});i.identity.pin.clone()};
+        let mut response=Vec::new();enroll(&mut response,first.clone(),b64(token),"phone".into(),"Phone".into());
+        let paired:serde_json::Value=serde_json::from_slice(&response).unwrap();assert_eq!(paired["type"],"paired");
+        let raw=std::fs::read(&path).unwrap();assert!(!raw.windows(5).any(|window|window==b"phone"));
+        let second=CompanionState::persistent(path.clone(),Arc::new(crate::capture::CaptureState::default())).unwrap();
+        {let i=second.0.lock().unwrap();assert_eq!(i.identity.pin,pin);assert!(i.trusted.contains_key("phone"));}
+        second.revoke("phone").unwrap();
+        let third=CompanionState::persistent(path.clone(),Arc::new(crate::capture::CaptureState::default())).unwrap();
+        assert!(!third.0.lock().unwrap().trusted.contains_key("phone"));
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn control_over_tls_processes_ordered_inputs_and_closes() {
+        use rustls::{ClientConfig,ClientConnection,RootCertStore,pki_types::ServerName};
+        let state=CompanionState::default(); let key=[8;32];
+        let cert={let mut i=state.0.lock().unwrap();i.running=true;i.sessions.insert("s".into(),Session{device_id:"d".into(),key,last_sequence:0,expires:Instant::now()+SESSION_TTL});i.identity.cert.clone()};
+        let listener=TcpListener::bind("127.0.0.1:0").unwrap(); let addr=listener.local_addr().unwrap();
+        let server=state.clone(); let worker=thread::spawn(move || { let (socket,_)=listener.accept().unwrap(); serve(socket,server); });
+        let mut roots=RootCertStore::empty();roots.add(cert).unwrap();
+        let config=ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+        let socket=TcpStream::connect(addr).unwrap();socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let conn=ClientConnection::new(Arc::new(config),ServerName::try_from("CoreLink.local").unwrap().to_owned()).unwrap();
+        let mut tls=StreamOwned::new(conn,socket);let nonce=b64([4u8;32]);
+        send(&mut tls,&serde_json::json!({"type":"control_open","session_id":"s","nonce":nonce,"mac":sign(&key,&transcript(&["control-open","s",&nonce]))})).unwrap();
+        let reply:serde_json::Value=read(&mut BufReader::new(&mut tls)).unwrap();assert_eq!(reply["type"],"control_ready");
+        for seq in [1u64,2] {let payload=r#"{"kind":"move","dx":0,"dy":0}"#; let tag=sign(&key,&transcript(&["input","s",&seq.to_string(),payload]));
+            send(&mut tls,&serde_json::json!({"type":"move","session_id":"s","sequence":seq,"payload":payload,"mac":tag})).unwrap();
+        }
+        for seq in [3u64,4] {let payload=r#"{"kind":"text","text":""}"#; let tag=sign(&key,&transcript(&["input","s",&seq.to_string(),payload]));
+            send(&mut tls,&serde_json::json!({"type":"input","session_id":"s","sequence":seq,"payload":payload,"mac":tag})).unwrap();
+            let response:serde_json::Value=read(&mut BufReader::new(&mut tls)).unwrap();assert_eq!(response["ok"],true);
+        }
+        drop(tls);worker.join().unwrap();
+        assert_eq!(state.0.lock().unwrap().sessions.get("s").unwrap().last_sequence,4);
+    }
+    #[test]
+    fn persistent_control_authenticates_and_rejects_nonce_replay() {
+        struct Duplex { incoming: std::io::Cursor<Vec<u8>>, outgoing: Vec<u8> }
+        impl Read for Duplex { fn read(&mut self, data: &mut [u8]) -> std::io::Result<usize> { self.incoming.read(data) } }
+        impl Write for Duplex {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> { self.outgoing.extend_from_slice(data); Ok(data.len()) }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let state=CompanionState::default(); let key=[8;32];
+        { let mut i=state.0.lock().unwrap(); i.running=true; i.sessions.insert("s".into(),Session{device_id:"phone".into(),key,last_sequence:0,expires:Instant::now()+SESSION_TTL}); }
+        let nonce=b64([9u8;32]); let tag=sign(&key,&transcript(&["control-open","s",&nonce]));
+        let payload=r#"{"kind":"text","text":""}"#;
+        let input_tag=sign(&key,&transcript(&["input","s","1",payload]));
+        let wire=format!("{}\n",serde_json::json!({"type":"input","session_id":"s","sequence":1,"payload":payload,"mac":input_tag}));
+        let mut stream=Duplex{incoming:std::io::Cursor::new(wire.into_bytes()),outgoing:Vec::new()};
+        control(&mut stream,state.clone(),"s".into(),nonce.clone(),tag.clone());
+        let replies:Vec<serde_json::Value>=String::from_utf8(stream.outgoing).unwrap().lines().map(|line|serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(replies[0]["type"],"control_ready"); assert_eq!(replies[1]["ok"],true);
+        let mut replay=Duplex{incoming:std::io::Cursor::new(Vec::new()),outgoing:Vec::new()};
+        control(&mut replay,state,"s".into(),nonce,tag);
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&replay.outgoing).unwrap()["type"],"control_rejected");
+    }
+    #[test]
     fn supported_keys_map_to_single_virtual_keys() {
         assert_eq!(virtual_key("tab"), Some(0x09));
         assert_eq!(virtual_key("\t"), Some(0x09));
@@ -890,12 +1012,15 @@ mod tests {
         assert_eq!(virtual_key("right"), Some(0x27));
         assert_eq!(virtual_key("down"), Some(0x28));
         assert_eq!(virtual_key("delete"), Some(0x2e));
+        assert_eq!(virtual_key("media_play_pause"), Some(0xb3)); assert_eq!(virtual_key("media_next"), Some(0xb0)); assert_eq!(virtual_key("media_previous"), Some(0xb1)); assert_eq!(virtual_key("volume_mute"), Some(0xad));
+        assert_eq!(virtual_key("volume_up"), Some(0xaf));
+        assert_eq!(virtual_key("volume_down"), Some(0xae));
         assert_eq!(virtual_key("a"), Some(b'A'));
         assert_eq!(virtual_key("F13"), None);
         assert_eq!(virtual_key("é"), None);
     }
     #[test]
-    fn tls_enrollment_returns_approval_and_registers_pending() {
+    fn tls_enrollment_pairs_immediately() {
         use rustls::{ClientConfig, ClientConnection, RootCertStore, pki_types::ServerName};
         let state=CompanionState::default();
         let token=[42;32];
@@ -911,14 +1036,25 @@ mod tests {
         let mut tls=StreamOwned::new(connection,socket);
         send(&mut tls,&serde_json::json!({"type":"enroll","token":b64(token),"device_id":"test-phone","name":"Test phone"})).unwrap();
         let response:serde_json::Value=read(&mut BufReader::new(&mut tls)).unwrap();
-        assert_eq!(response["type"],"approval_required");
-        assert_eq!(state.snapshot().pending.len(),1);
+        assert_eq!(response["type"],"paired");
+        assert_eq!(state.snapshot().trusted_devices.len(),1);
         state.stop();worker.join().unwrap();
+    }
+    #[test]
+    fn qr_pairing_is_immediate_and_one_time() {
+        let state=CompanionState::default(); let token=[42;32];
+        { let mut i=state.0.lock().unwrap(); i.running=true; i.enrollment=Some(Enrollment{token,expires:Instant::now()+ENROLLMENT_TTL,expires_at:unix()+120,used:false}); }
+        let mut first=Vec::new(); enroll(&mut first,state.clone(),b64(token),"phone".into(),"Phone".into());
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&first).unwrap()["type"],"paired");
+        assert_eq!(state.snapshot().trusted_devices.len(),1);
+        let mut replay=Vec::new(); enroll(&mut replay,state,b64(token),"other".into(),"Other".into());
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&replay).unwrap()["type"],"rejected");
     }
     #[test]
     fn input_authenticates_exact_payload_and_rejects_replay() {
         let state = CompanionState::default();
         let key = [7; 32];
+        state.0.lock().unwrap().running = true;
         state.0.lock().unwrap().sessions.insert(
             "s".into(),
             Session {

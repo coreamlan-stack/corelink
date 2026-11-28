@@ -23,7 +23,7 @@ import javax.net.ssl.SSLSocket
 
 /** Prototype receiver. The paired TLS socket and authentication are provided by CoreLinkClient. */
 @Composable
-fun DesktopVideo(open: () -> Result<SSLSocket>, modifier: Modifier = Modifier) {
+fun DesktopVideo(open: () -> Result<SSLSocket>, modifier: Modifier = Modifier, fill: Boolean = false) {
     var status by remember { mutableStateOf("Waiting for Windows capture…") }
     var imageView by remember { mutableStateOf<ImageView?>(null) }
     val scope = rememberCoroutineScope()
@@ -48,16 +48,21 @@ fun DesktopVideo(open: () -> Result<SSLSocket>, modifier: Modifier = Modifier) {
                 val height = header.getInt("height")
                 check(width in 1..3840 && height in 1..2160 && width.toLong() * height <= 8_294_400) { "Unsupported video size" }
                 val rawSize = width * height * 4
+                val pixels = ByteArray(rawSize)
+                val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
                 withContext(Dispatchers.Main) { status = "" }
                 while (true) {
                     val size = input.readInt()
                     check(size in 1..8 * 1024 * 1024) { "Invalid video frame size" }
                     val compressed = ByteArray(size)
                     input.readFully(compressed)
-                    val pixels = inflateFrame(compressed, rawSize)
-                    val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-                    bitmap.copyPixelsFromBuffer(ByteBuffer.wrap(pixels))
-                    withContext(Dispatchers.Main) { imageView?.setImageBitmap(bitmap) }
+                    inflateFrameInto(compressed, pixels)
+                    bgraToRgba(pixels)
+                    withContext(Dispatchers.Main) {
+                        bitmap.copyPixelsFromBuffer(ByteBuffer.wrap(pixels))
+                        imageView?.setImageBitmap(bitmap)
+                        imageView?.invalidate()
+                    }
                 }
             } catch (e: Exception) {
                 if (!closed.get() && isActive) withContext(Dispatchers.Main) { status = e.message ?: "Reconnecting to the PC…" }
@@ -70,8 +75,17 @@ fun DesktopVideo(open: () -> Result<SSLSocket>, modifier: Modifier = Modifier) {
         onDispose { closed.set(true); runCatching { socket.getAndSet(null)?.close() }; job.cancel() }
     }
     Box(modifier) {
-        AndroidView(factory = { context -> ImageView(context).apply { scaleType = ImageView.ScaleType.FIT_CENTER; imageView = this } }, modifier = Modifier.fillMaxSize())
+        AndroidView(factory = { context -> ImageView(context).apply { imageView = this } }, update = { it.scaleType = if (fill) ImageView.ScaleType.FIT_XY else ImageView.ScaleType.FIT_CENTER }, modifier = Modifier.fillMaxSize())
         if (status.isNotEmpty()) Text(status)
+    }
+}
+
+internal fun bgraToRgba(pixels: ByteArray) {
+    require(pixels.size % 4 == 0)
+    for (i in pixels.indices step 4) {
+        val blue = pixels[i]
+        pixels[i] = pixels[i + 2]
+        pixels[i + 2] = blue
     }
 }
 
@@ -86,10 +100,14 @@ private fun readHeader(input: DataInputStream): String {
 }
 
 internal fun inflateFrame(compressed: ByteArray, expected: Int): ByteArray {
+    return ByteArray(expected).also { inflateFrameInto(compressed, it) }
+}
+
+private fun inflateFrameInto(compressed: ByteArray, result: ByteArray) {
     val inflater = Inflater()
     try {
         inflater.setInput(compressed)
-        val result = ByteArray(expected)
+        val expected = result.size
         var offset = 0
         while (offset < expected && !inflater.finished()) {
             val count = inflater.inflate(result, offset, expected - offset)
@@ -100,6 +118,5 @@ internal fun inflateFrame(compressed: ByteArray, expected: Int): ByteArray {
             check(inflater.inflate(ByteArray(1)) == 0) { "Video frame exceeds expected size" }
         }
         check(offset == expected && inflater.finished() && inflater.remaining == 0) { "Invalid video frame length" }
-        return result
     } finally { inflater.end() }
 }

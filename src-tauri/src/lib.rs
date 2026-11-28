@@ -3,14 +3,14 @@ use std::{io::Read, time::Duration};
 use std::{
     net::Ipv4Addr,
     process::{Child, Command, Stdio},
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
-use tauri::State;
+use tauri::{Manager, State};
 use tauri_plugin_autostart::MacosLauncher;
 use wait_timeout::ChildExt;
 mod companion;
 mod capture;
-mod audio;
+mod trusted_store;
 use companion::{CompanionSnapshot, CompanionState};
 
 #[derive(Default)]
@@ -353,22 +353,35 @@ fn revoke_companion_device(
 }
 
 #[tauri::command]
-fn capture_snapshot(state: State<'_, capture::CaptureState>) -> capture::CaptureSnapshot {
+fn capture_snapshot(state: State<'_, Arc<capture::CaptureState>>) -> capture::CaptureSnapshot {
     state.clear_finished(); state.snapshot()
 }
 #[tauri::command]
-fn start_capture(window: tauri::WebviewWindow, state: State<'_, capture::CaptureState>) -> Result<(), String> {
+fn start_capture(window: tauri::WebviewWindow, state: State<'_, Arc<capture::CaptureState>>) -> Result<(), String> {
     state.clear_finished();
     state.start(window.hwnd().map_err(|e| e.to_string())?.0 as isize)
 }
 #[tauri::command]
-fn stop_capture(state: State<'_, capture::CaptureState>) { state.stop(); }
+fn stop_capture(state: State<'_, Arc<capture::CaptureState>>) { state.stop(); }
 
 pub fn run() {
     tauri::Builder::default()
         .manage(MirrorState::default())
-        .manage(CompanionState::default())
-        .manage(capture::CaptureState::default())
+        .setup(|app| {
+            let capture = Arc::new(capture::CaptureState::default());
+            let path = app.path().app_data_dir()?.join("companion.dat");
+            let companion = CompanionState::persistent(path, capture.clone())
+                .map_err(std::io::Error::other)?;
+            app.manage(capture);
+            app.manage(companion);
+            let app_handle = app.handle().clone();
+            std::thread::spawn(move || {
+                if let Err(error) = app_handle.state::<CompanionState>().start() {
+                    eprintln!("CoreLink companion did not start: {error}");
+                }
+            });
+            Ok(())
+        })
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
             None,

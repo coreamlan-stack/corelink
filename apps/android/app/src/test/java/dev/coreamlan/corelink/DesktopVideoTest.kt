@@ -7,6 +7,12 @@ import java.io.ByteArrayOutputStream
 import java.util.zip.DeflaterOutputStream
 
 class DesktopVideoTest {
+    @Test fun preservesRedAndBlueWhenConvertingDesktopPixels() {
+        val pixels = byteArrayOf(0, 0, 255.toByte(), 255.toByte(), 255.toByte(), 0, 0, 255.toByte())
+        bgraToRgba(pixels)
+        assertArrayEquals(byteArrayOf(255.toByte(), 0, 0, 255.toByte(), 0, 0, 255.toByte(), 255.toByte()), pixels)
+    }
+
     private fun compress(bytes: ByteArray): ByteArray {
         val output = ByteArrayOutputStream()
         DeflaterOutputStream(output).use { it.write(bytes) }

@@ -92,11 +92,11 @@ git push -u origin main
 
 ## Phase 2 companion input
 
-`apps/android/` contains the native Kotlin + Jetpack Compose companion. Start the secure companion from the Windows UI and scan its QR code with CoreLink Android. The QR carries a private-LAN endpoint, TLS certificate SHA-256 pin, a random 256-bit one-time enrollment credential, and a two-minute expiry. Android completes TLS 1.3 certificate pinning before it transmits the enrollment credential. Windows must explicitly approve the phone.
+`apps/android/` contains the native Kotlin + Jetpack Compose companion. Open CoreLink on Windows and scan its QR code with CoreLink Android. The QR carries a private-LAN endpoint, TLS certificate SHA-256 pin, a random 256-bit one-time enrollment credential, and a two-minute expiry. Android verifies the certificate pin before sending the credential. A scan grants access without a second approval, so keep the QR private.
 
-After approval, every input or disconnect request is HMAC-authenticated, sequence-numbered, bounded and checked against a 15-minute session. The service binds only to the selected private IPv4 interface; stopping it clears active sessions. Trusted devices can be revoked from the Windows UI. The old six-digit plaintext companion protocol is removed.
+After pairing, the desktop identity and device credentials are protected by Windows user-bound encryption; the phone stores its credential in encrypted storage. When the phone app is open, it reconnects to the saved PC on a reachable private network, using LAN discovery if the address changes. Inputs and disconnect requests are HMAC-authenticated and sequence-numbered. Trusted devices can be revoked from the Windows UI.
 
-The experimental Windows-to-phone preview uses an opt-in source picker and a pinned, authenticated TLS connection. It currently sends compressed frames at up to 960×540 and 5 fps; this is a prototype, not the planned H.264/QUIC stream. The existing Android-to-Windows ADB/scrcpy mirroring remains separate. See [Companion setup](docs/COMPANION_SETUP.md) and the [Windows video streaming plan](docs/WINDOWS_VIDEO_STREAMING_PLAN.md).
+The phone opens to a control dashboard. Selecting View PC starts an experimental primary-display preview over pinned, authenticated TLS; returning to the dashboard stops screen capture. It uses compressed full frames up to 1080p, with actual frame rate dependent on the PC and network; H.264/QUIC is not yet implemented. Phone volume buttons control PC volume while connected, and PC sound stays on the PC. Android-to-Windows ADB/scrcpy mirroring remains separate. See [Companion setup](docs/COMPANION_SETUP.md) and the [Windows video streaming plan](docs/WINDOWS_VIDEO_STREAMING_PLAN.md).
 
 ### Android build
 

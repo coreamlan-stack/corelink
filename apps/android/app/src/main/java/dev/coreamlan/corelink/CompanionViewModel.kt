@@ -9,54 +9,119 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.channels.Channel
 import org.json.JSONObject
 import javax.net.ssl.SSLSocket
 
-data class CompanionUiState(val connected: Boolean = false, val busy: Boolean = false, val message: String = "", val error: Boolean = false)
+data class CompanionUiState(val connected: Boolean = false, val busy: Boolean = false, val message: String = "", val error: Boolean = false, val hasSavedPc: Boolean = false)
 
 class CompanionViewModel : ViewModel() {
     private val _ui = MutableStateFlow(CompanionUiState())
     val ui = _ui.asStateFlow()
     private var client: CoreLinkClient? = null
+    private var initialized = false
+    private var foreground = false
+    private var autoReconnect = true
     private var inputJob: Job? = null
-    private val inputQueue = Channel<JSONObject>(capacity = 128)
+    private val inputQueue = OrderedMoveQueue<JSONObject>(
+        move = { if (it.optString("kind") == "move") it.optInt("dx") to it.optInt("dy") else null },
+        merged = { previous, dx, dy -> previous.put("dx", dx).put("dy", dy) },
+    )
+    private val inputSignal = Channel<Unit>(capacity = Channel.CONFLATED)
     init {
         inputJob = viewModelScope.launch {
-            for (value in inputQueue) {
-                val active = client ?: continue
-                withContext(Dispatchers.IO) { active.input(value) }.onFailure { problem ->
-                    if (client === active) _ui.value = _ui.value.copy(message = problem.message ?: "Input rejected", error = true)
+            for (signal in inputSignal) {
+                while (true) {
+                    val value = inputQueue.poll() ?: break
+                    val active = client ?: continue
+                    withContext(Dispatchers.IO) { active.input(value) }.onFailure { problem ->
+                        if (client === active) {
+                            client = null
+                            inputQueue.clear()
+                            _ui.value = CompanionUiState(message = problem.message ?: "PC connection lost. Try connecting again.", error = true, hasSavedPc = true)
+                            viewModelScope.launch(Dispatchers.IO) { active.disconnect() }
+                        }
+                    }
                 }
             }
         }
     }
     fun pair(context: Context, qrPayload: String) {
         if (_ui.value.busy) return
-        _ui.value = CompanionUiState(busy = true, message = "Requesting desktop approval…")
+        autoReconnect = true
+        _ui.value = _ui.value.copy(busy = true, message = "Connecting securely…", error = false)
         viewModelScope.launch {
             val result = withContext(Dispatchers.IO) {
                 runCatching { CoreLinkClient.fromQr(context, qrPayload) }.fold(
-                    onSuccess = { candidate -> candidate.pair(android.os.Build.MODEL).map { candidate } },
+                    onSuccess = { candidate -> candidate.pair(android.os.Build.MODEL).fold(
+                        onSuccess = { candidate.connect().map { candidate } },
+                        onFailure = { Result.failure(it) }
+                    ) },
                     onFailure = { Result.failure(it) }
                 )
             }
-            result.onSuccess { candidate -> client = candidate; _ui.value = CompanionUiState(connected = true, message = "Connected") }
-                .onFailure { problem -> _ui.value = CompanionUiState(message = problem.message ?: "Pairing failed", error = true) }
+            result.onSuccess { candidate -> client = candidate; _ui.value = CompanionUiState(connected = true, message = "Connected", hasSavedPc = true) }
+                .onFailure { problem -> _ui.value = _ui.value.copy(busy = false, message = problem.message ?: "Pairing failed", error = true) }
+        }
+    }
+    fun initialize(context: Context) {
+        if (initialized) return
+        initialized = true
+        val app = context.applicationContext
+        viewModelScope.launch {
+            val saved = withContext(Dispatchers.IO) { runCatching { CoreLinkClient.fromSaved(app) != null }.getOrDefault(false) }
+            _ui.value = _ui.value.copy(hasSavedPc = saved)
+            while (true) {
+                if (foreground && autoReconnect && _ui.value.hasSavedPc && !_ui.value.busy) {
+                    val active = client
+                    if (active == null) reconnect(app)
+                    else withContext(Dispatchers.IO) { active.heartbeat() }.onFailure {
+                        if (client === active) {
+                            client = null
+                            inputQueue.clear()
+                            _ui.value = CompanionUiState(message = "Connection lost. Trying to reconnect…", error = true, hasSavedPc = true)
+                        }
+                    }
+                }
+                delay(5_000)
+            }
+        }
+    }
+    fun setForeground(value: Boolean) { foreground = value }
+    fun reconnect(context: Context) {
+        if (_ui.value.busy || _ui.value.connected) return
+        autoReconnect = true
+        _ui.value = _ui.value.copy(busy = true, message = "Connecting to your saved PC…", error = false)
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) { CoreLinkClient.reconnectSaved(context) }
+            result.onSuccess { candidate ->
+                if (foreground && autoReconnect) {
+                    client = candidate
+                    _ui.value = CompanionUiState(connected = true, message = "Connected", hasSavedPc = true)
+                } else {
+                    viewModelScope.launch(Dispatchers.IO) { candidate.disconnect() }
+                    _ui.value = _ui.value.copy(busy = false, message = "")
+                }
+            }
+                .onFailure { problem -> _ui.value = _ui.value.copy(busy = false, message = problem.message ?: "Could not connect to the saved PC", error = true) }
         }
     }
     fun input(value: JSONObject) {
         if (!_ui.value.connected || client == null) return
-        if (inputQueue.trySend(value).isFailure) _ui.value = _ui.value.copy(message = "Control queue is full; try again.", error = true)
+        val accepted = inputQueue.offer(value)
+        if (accepted) inputSignal.trySend(Unit)
+        else if (value.optString("kind") != "move") _ui.value = _ui.value.copy(message = "Control queue is full; try again.", error = true)
     }
     fun openVideo(): Result<SSLSocket> = client?.openVideo() ?: Result.failure(IllegalStateException("Pair with this PC first"))
     fun openAudio(): Result<SSLSocket> = client?.openAudio() ?: Result.failure(IllegalStateException("Pair with this PC first"))
     fun disconnect() {
+        autoReconnect = false
         val old = client ?: return
         client = null
-        while (inputQueue.tryReceive().isSuccess) { /* discard controls for the old session */ }
+        inputQueue.clear()
         viewModelScope.launch(Dispatchers.IO) { old.disconnect() }
-        _ui.value = CompanionUiState(message = "Disconnected")
+        _ui.value = CompanionUiState(message = "Disconnected", hasSavedPc = true)
     }
     override fun onCleared() { disconnect(); super.onCleared() }
 }

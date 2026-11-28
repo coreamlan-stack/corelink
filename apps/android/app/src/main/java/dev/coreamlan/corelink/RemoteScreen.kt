@@ -3,73 +3,114 @@ package dev.coreamlan.corelink
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import org.json.JSONObject
 
-/** The desktop itself acts as a relative touchpad; tapping clicks at the PC pointer. */
+private val Panel = Color(0xF0191A1E)
+private val Accent = Color(0xffffa84d)
+
+/** Use the picture as a relative touchpad: drag to move and tap to click. */
 @Composable
-fun RemoteScreen(vm: CompanionViewModel, ui: CompanionUiState) {
+fun RemoteScreen(vm: CompanionViewModel, ui: CompanionUiState, onDashboard: () -> Unit) {
     var controls by remember { mutableStateOf(true) }
+    var fillScreen by remember { mutableStateOf(true) }
+    var pointerSpeed by remember { mutableFloatStateOf(2.4f) }
     var keyboard by remember { mutableStateOf(false) }
     var holding by remember { mutableStateOf(false) }
+    val currentHolding by rememberUpdatedState(holding)
     var text by remember { mutableStateOf("") }
+    var ctrl by remember { mutableStateOf(false) }
+    var alt by remember { mutableStateOf(false) }
     val keyboardController = LocalSoftwareKeyboardController.current
-    fun key(value: String, ctrl: Boolean = false, alt: Boolean = false, shift: Boolean = false) {
-        vm.input(JSONObject().put("kind", "key").put("key", value).put("ctrl", ctrl).put("alt", alt).put("shift", shift))
+    val inputFocus = remember { FocusRequester() }
+    fun send(kind: String, field: String, value: Any) {
+        vm.input(JSONObject().put("kind", kind).put(field, value))
+    }
+    fun key(value: String, control: Boolean = false, alternate: Boolean = false) {
+        vm.input(JSONObject().put("kind", "key").put("key", value).put("ctrl", control).put("alt", alternate).put("shift", false))
+    }
+    fun release() {
+        if (holding) { vm.input(JSONObject().put("kind", "button").put("button", "left").put("down", false)); holding = false }
     }
     DisposableEffect(vm) {
-        onDispose { if (holding) vm.input(JSONObject().put("kind", "button").put("button", "left").put("down", false)) }
+        onDispose { if (currentHolding) vm.input(JSONObject().put("kind", "button").put("button", "left").put("down", false)) }
+    }
+    LaunchedEffect(keyboard) {
+        if (keyboard) { inputFocus.requestFocus(); keyboardController?.show() }
     }
     Box(Modifier.fillMaxSize().background(Color.Black)) {
-        DesktopVideo(open = { vm.openVideo() }, modifier = Modifier.fillMaxSize())
-        DesktopAudio(open = { vm.openAudio() })
+        DesktopVideo(open = { vm.openVideo() }, modifier = Modifier.fillMaxSize(), fill = fillScreen)
         Box(Modifier.fillMaxSize()
-            .pointerInput(Unit) { detectTapGestures(onTap = { vm.input(JSONObject().put("kind", "click").put("button", "left")) }, onLongPress = { vm.input(JSONObject().put("kind", "click").put("button", "right")) }) }
-            .pointerInput(Unit) { detectDragGestures { change, drag -> change.consume(); vm.input(JSONObject().put("kind", "move").put("dx", drag.x.toInt().coerceIn(-5000, 5000)).put("dy", drag.y.toInt().coerceIn(-5000, 5000))) } })
-        Column(Modifier.align(Alignment.TopEnd).padding(6.dp), horizontalAlignment = Alignment.End) {
-            FilledTonalButton(onClick = { controls = !controls }, contentPadding = PaddingValues(horizontal = 12.dp), modifier = Modifier.height(40.dp)) { Text(if (controls) "Hide controls" else "Controls") }
-            if (controls) {
-                Row(Modifier.background(Color(0xD91B1B1F), RoundedCornerShape(10.dp)).padding(4.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    TextButton(onClick = { vm.input(JSONObject().put("kind", "click").put("button", "left")) }) { Text("Left") }
-                    TextButton(onClick = { vm.input(JSONObject().put("kind", "click").put("button", "right")) }) { Text("Right") }
-                    TextButton(onClick = { holding = !holding; vm.input(JSONObject().put("kind", "button").put("button", "left").put("down", holding)) }) { Text(if (holding) "Release" else "Hold") }
-                    TextButton(onClick = { vm.input(JSONObject().put("kind", "scroll").put("dy", 120)) }) { Text("↑") }
-                    TextButton(onClick = { vm.input(JSONObject().put("kind", "scroll").put("dy", -120)) }) { Text("↓") }
-                    TextButton(onClick = { keyboard = !keyboard; if (!keyboard) keyboardController?.hide() }) { Text("Keyboard") }
-                    TextButton(onClick = { if (holding) { vm.input(JSONObject().put("kind", "button").put("button", "left").put("down", false)); holding = false }; vm.disconnect() }) { Text("Disconnect", color = Color(0xffffaaa5)) }
+            .pointerInput(Unit) { detectTapGestures(onTap = { send("click", "button", "left") }, onLongPress = { send("click", "button", "right") }) }
+            .pointerInput(pointerSpeed) {
+                var xRemainder = 0f
+                var yRemainder = 0f
+                detectDragGestures(onDragStart = { xRemainder = 0f; yRemainder = 0f }) { change, drag ->
+                    change.consume()
+                    xRemainder += drag.x * pointerSpeed; yRemainder += drag.y * pointerSpeed
+                    val dx = xRemainder.toInt().coerceIn(-5000, 5000); val dy = yRemainder.toInt().coerceIn(-5000, 5000)
+                    xRemainder -= dx; yRemainder -= dy
+                    if (dx != 0 || dy != 0) vm.input(JSONObject().put("kind", "move").put("dx", dx).put("dy", dy))
                 }
-                if (keyboard) {
-                    Row(Modifier.background(Color(0xE61B1B1F), RoundedCornerShape(10.dp)).padding(4.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                        TextButton(onClick = { key("escape") }) { Text("Esc") }
-                        TextButton(onClick = { key("tab") }) { Text("Tab") }
-                        TextButton(onClick = { key("backspace") }) { Text("⌫") }
-                        TextButton(onClick = { key("enter") }) { Text("Enter") }
-                        TextButton(onClick = { key("a", ctrl = true) }) { Text("Ctrl+A") }
-                        TextButton(onClick = { key("c", ctrl = true) }) { Text("Ctrl+C") }
-                        TextButton(onClick = { key("v", ctrl = true) }) { Text("Ctrl+V") }
-                    }
-                    Row(Modifier.background(Color(0xE61B1B1F), RoundedCornerShape(10.dp)).padding(4.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                        TextButton(onClick = { key("left") }) { Text("←") }
-                        TextButton(onClick = { key("up") }) { Text("↑") }
-                        TextButton(onClick = { key("down") }) { Text("↓") }
-                        TextButton(onClick = { key("right") }) { Text("→") }
-                        TextButton(onClick = { key("delete") }) { Text("Delete") }
-                    }
-                    OutlinedTextField(value = text, onValueChange = { value ->
-                        if (value.isNotEmpty()) { vm.input(JSONObject().put("kind", "text").put("text", value)); text = "" }
-                    }, label = { Text("Type on PC") }, singleLine = true, modifier = Modifier.width(280.dp).background(Color(0xE61B1B1F)))
+            })
+        Column(Modifier.align(Alignment.TopEnd).displayCutoutPadding().padding(8.dp), horizontalAlignment = Alignment.End) {
+            FilledTonalButton(onClick = { controls = !controls; if (!controls) { keyboard = false; keyboardController?.hide() } }, contentPadding = PaddingValues(horizontal = 16.dp), modifier = Modifier.height(44.dp), colors = ButtonDefaults.filledTonalButtonColors(containerColor = Panel, contentColor = Color.White)) {
+                Text(if (controls) "Hide controls" else "Controls", style = MaterialTheme.typography.labelLarge)
+            }
+            if (ui.error && ui.message.isNotBlank()) Text(ui.message, color = Color(0xffffaaa5), modifier = Modifier.background(Panel, RoundedCornerShape(8.dp)).padding(8.dp))
+        }
+        if (controls) Column(Modifier.align(Alignment.BottomCenter).displayCutoutPadding().imePadding().padding(8.dp).fillMaxWidth().background(Panel, RoundedCornerShape(16.dp)).padding(horizontal = 8.dp, vertical = 4.dp)) {
+            if (keyboard) {
+                Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), verticalAlignment = Alignment.CenterVertically) {
+                    RemoteAction("Esc") { key("escape") }
+                    RemoteAction("Tab") { key("tab", ctrl, alt); ctrl = false; alt = false }
+                    RemoteAction("⌫") { key("backspace") }
+                    RemoteAction("Enter") { key("enter") }
+                    RemoteAction(if (ctrl) "Ctrl •" else "Ctrl", ctrl) { ctrl = !ctrl }
+                    RemoteAction(if (alt) "Alt •" else "Alt", alt) { alt = !alt }
+                    RemoteAction("←") { key("left") }; RemoteAction("↑") { key("up") }; RemoteAction("↓") { key("down") }; RemoteAction("→") { key("right") }
+                    RemoteAction("Del") { key("delete") }
                 }
-                if (ui.error) Text(ui.message, color = Color(0xffffaaa5), modifier = Modifier.background(Color(0xE61B1B1F)).padding(6.dp))
+                OutlinedTextField(value = text, onValueChange = { value ->
+                    if (value.isNotEmpty()) {
+                        if ((ctrl || alt) && value.length == 1 && value[0].isLetterOrDigit() && value[0].code < 128) key(value, ctrl, alt)
+                        else send("text", "text", value)
+                        ctrl = false; alt = false; text = ""
+                    }
+                }, label = { Text("Type on PC") }, singleLine = true, modifier = Modifier.fillMaxWidth().focusRequester(inputFocus))
+            }
+            Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), verticalAlignment = Alignment.CenterVertically) {
+                Text("CORELINK", modifier = Modifier.padding(horizontal = 10.dp), color = Accent, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
+                RemoteAction("Left click") { send("click", "button", "left") }
+                RemoteAction("Right click") { send("click", "button", "right") }
+                RemoteAction(if (holding) "Release drag" else "Hold to drag", holding) { holding = !holding; vm.input(JSONObject().put("kind", "button").put("button", "left").put("down", holding)) }
+                RemoteAction("Scroll ↑") { send("scroll", "dy", 120) }
+                RemoteAction("Scroll ↓") { send("scroll", "dy", -120) }
+                RemoteAction("Speed ${pointerSpeed}×") { pointerSpeed = when (pointerSpeed) { 2.4f -> 4.0f; 4.0f -> 1.2f; else -> 2.4f } }
+                RemoteAction(if (keyboard) "Hide keyboard" else "Keyboard", keyboard) { keyboard = !keyboard; if (!keyboard) keyboardController?.hide() }
+                RemoteAction(if (fillScreen) "Keep proportions" else "Stretch to fill") { fillScreen = !fillScreen }
+                RemoteAction("Dashboard") { release(); onDashboard() }
+                RemoteAction("Disconnect") { release(); vm.disconnect() }
             }
         }
     }
+}
+
+@Composable
+private fun RemoteAction(label: String, active: Boolean = false, action: () -> Unit) {
+    TextButton(onClick = action, modifier = Modifier.heightIn(min = 44.dp), contentPadding = PaddingValues(horizontal = 10.dp), colors = ButtonDefaults.textButtonColors(contentColor = if (active) Accent else Color.White)) { Text(label, style = MaterialTheme.typography.labelLarge, maxLines = 1) }
 }
