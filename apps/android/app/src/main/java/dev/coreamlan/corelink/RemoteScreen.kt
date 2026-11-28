@@ -16,6 +16,8 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import org.json.JSONObject
@@ -94,19 +96,25 @@ fun RemoteScreen(vm: CompanionViewModel, ui: CompanionUiState, onDashboard: () -
                 }, label = { Text("Type on PC") }, singleLine = true, modifier = Modifier.fillMaxWidth().focusRequester(inputFocus))
             }
             Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), verticalAlignment = Alignment.CenterVertically) {
-                Text("CORELINK", modifier = Modifier.padding(horizontal = 10.dp), color = Accent, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
-                RemoteAction("Left click") { send("click", "button", "left") }
-                RemoteAction("Right click") { send("click", "button", "right") }
-                RemoteAction(if (holding) "Release drag" else "Hold to drag", holding) { holding = !holding; vm.input(JSONObject().put("kind", "button").put("button", "left").put("down", holding)) }
-                RemoteAction("Scroll ↑") { send("scroll", "dy", 120) }
-                RemoteAction("Scroll ↓") { send("scroll", "dy", -120) }
+                IconRemoteAction("mouse_left", "Left click") { send("click", "button", "left") }
+                IconRemoteAction("mouse_right", "Right click") { send("click", "button", "right") }
+                IconRemoteAction("drag", if (holding) "Release drag" else "Hold to drag", holding) { holding = !holding; vm.input(JSONObject().put("kind", "button").put("button", "left").put("down", holding)) }
+                IconRemoteAction("up", "Scroll up") { send("scroll", "dy", 120) }
+                IconRemoteAction("down", "Scroll down") { send("scroll", "dy", -120) }
                 RemoteAction("Speed ${pointerSpeed}×") { pointerSpeed = when (pointerSpeed) { 2.4f -> 4.0f; 4.0f -> 1.2f; else -> 2.4f } }
-                RemoteAction(if (keyboard) "Hide keyboard" else "Keyboard", keyboard) { keyboard = !keyboard; if (!keyboard) keyboardController?.hide() }
-                RemoteAction(if (fillScreen) "Keep proportions" else "Stretch to fill") { fillScreen = !fillScreen }
-                RemoteAction("Dashboard") { release(); onDashboard() }
-                RemoteAction("Disconnect") { release(); vm.disconnect() }
+                IconRemoteAction("keyboard", if (keyboard) "Hide keyboard" else "Keyboard", keyboard) { keyboard = !keyboard; if (!keyboard) keyboardController?.hide() }
+                IconRemoteAction("fit", if (fillScreen) "Keep proportions" else "Stretch to fill") { fillScreen = !fillScreen }
+                IconRemoteAction("dashboard", "Dashboard") { release(); onDashboard() }
+                IconRemoteAction("power", "Disconnect") { release(); vm.disconnect() }
             }
         }
+    }
+}
+
+@Composable
+private fun IconRemoteAction(icon: String, label: String, active: Boolean = false, action: () -> Unit) {
+    TextButton(onClick = action, modifier = Modifier.sizeIn(minWidth = 48.dp, minHeight = 48.dp).semantics { contentDescription = label }, contentPadding = PaddingValues(12.dp), colors = ButtonDefaults.textButtonColors(contentColor = if (active) Accent else Color.White)) {
+        RemoteIcon(icon, if (active) Accent else Color.White)
     }
 }
 
